@@ -1,15 +1,31 @@
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import java.io.OutputStream;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.sql.*;
+import java.sql.Array;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
 import java.time.Duration;
-import java.util.*;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.postgresql.util.PGobject;
@@ -43,15 +59,59 @@ public class Main {
   static final String TALK_COLS =
       "slug, title, description, format, youtube_id, year, speaker_slug, languages, topics";
 
+  static final int POOL_SIZE = 8;
+  static final Object poolLock = new Object();
+  static final ArrayDeque<Connection> idle = new ArrayDeque<>();
+  static int poolOpened;
+  static boolean poolReady;
+
+  static final AtomicInteger sqlCount = new AtomicInteger();
+  static final AtomicInteger connectCount = new AtomicInteger();
+
+  interface ConnectFn {
+    Connection open() throws Exception;
+  }
+
+  interface QueryFn {
+    List<Map<String, Object>> query(String sql, Object[] args) throws SQLException;
+  }
+
+  static ConnectFn connectFn;
+  static QueryFn queryFn;
+
+  static final class HttpResult {
+    final int status;
+    final String body;
+
+    HttpResult(int status, String body) {
+      this.status = status;
+      this.body = body;
+    }
+  }
+
   public static void main(String[] args) throws Exception {
     Class.forName("org.postgresql.Driver");
+    openPool();
     int port = Integer.parseInt(System.getenv().getOrDefault("PORT", "4007"));
-    HttpServer server = HttpServer.create(new InetSocketAddress("0.0.0.0", port), 0);
+    HttpServer server = HttpServer.create(listenAddress(port), 0);
     server.createContext("/", Main::handle);
-    server.setExecutor(java.util.concurrent.Executors.newCachedThreadPool());
+    server.setExecutor(Executors.newCachedThreadPool());
     server.start();
     System.err.println("carolina-codes-java listening on :" + port);
     register(port);
+  }
+
+  static String listenHost() {
+    return "::";
+  }
+
+  static InetSocketAddress listenAddress(int port) throws Exception {
+    return new InetSocketAddress(InetAddress.getByName(listenHost()), port);
+  }
+
+  static void resetCounts() {
+    sqlCount.set(0);
+    connectCount.set(0);
   }
 
   static Map<String, Object> endpoint(String method, String path, List<String> query) {
@@ -62,7 +122,7 @@ public class Main {
     return row;
   }
 
-  static Connection conn() throws Exception {
+  static Connection newJdbc() throws Exception {
     String raw = DSN.replace("postgres://", "http://").replace("postgresql://", "http://");
     URI u = URI.create(raw);
     String user = "postgres";
@@ -74,170 +134,276 @@ public class Main {
     }
     int port = u.getPort() == -1 ? 5432 : u.getPort();
     String jdbc = "jdbc:postgresql://" + u.getHost() + ":" + port + u.getPath();
+    String query = u.getQuery();
+    jdbc += (query == null || query.isEmpty()) ? "?sslmode=disable" : "?" + query;
+    if (!jdbc.contains("sslmode=")) {
+      jdbc += "&sslmode=disable";
+    }
+    if (!jdbc.contains("ssl=")) {
+      jdbc += "&ssl=false";
+    }
     return DriverManager.getConnection(jdbc, user, pass);
   }
 
+  static Connection openConnection() throws Exception {
+    connectCount.incrementAndGet();
+    if (connectFn != null) {
+      return connectFn.open();
+    }
+    return newJdbc();
+  }
+
+  static void openPool() throws Exception {
+    synchronized (poolLock) {
+      if (poolReady) {
+        return;
+      }
+      idle.addLast(openConnection());
+      poolOpened = 1;
+      poolReady = true;
+    }
+  }
+
+  static Connection acquire() throws Exception {
+    synchronized (poolLock) {
+      if (!poolReady) {
+        openPool();
+      }
+      while (true) {
+        if (!idle.isEmpty()) {
+          return idle.removeFirst();
+        }
+        if (poolOpened < POOL_SIZE) {
+          poolOpened++;
+          return openConnection();
+        }
+        poolLock.wait();
+      }
+    }
+  }
+
+  static void release(Connection c) {
+    if (c == null) {
+      return;
+    }
+    synchronized (poolLock) {
+      idle.addLast(c);
+      poolLock.notify();
+    }
+  }
+
   static void handle(HttpExchange ex) {
+    URI uri = ex.getRequestURI();
+    String path = uri.getPath();
+    String qs = uri.getQuery() == null ? "" : uri.getQuery();
+    HttpResult result = dispatch(path, qs);
     try {
-      URI uri = ex.getRequestURI();
-      String path = uri.getPath().replaceAll("/$", "");
-      if (path.isEmpty()) path = "/";
-      String qs = uri.getQuery() == null ? "" : uri.getQuery();
-      if (path.equals("/")) {
-        send(ex, 200, identity());
-        return;
-      }
-      if (path.equals("/health")) {
-        send(ex, 200, "{\"ok\":true}");
-        return;
-      }
-      try (Connection c = conn()) { // SQLException via Exception
-        if (path.equals("/v1/years")) {
-          send(ex, 200, wrap(query(c, "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC")));
-          return;
-        }
-        if (path.equals("/v1/speakers")) {
-          String year = param(qs, "year");
-          if (year != null) {
-            int y = Integer.parseInt(year);
-            List<Map<String, Object>> speakers =
-                query(
-                    c,
-                    "SELECT "
-                        + SPEAKER_COLS
-                        + " FROM v1_speakers WHERE slug IN (SELECT speaker_slug FROM v1_talks WHERE year = ?) ORDER BY last_name, first_name",
-                    y);
-            for (Map<String, Object> sp : speakers) {
-              List<Map<String, Object>> talks =
-                  query(c, "SELECT " + TALK_COLS + " FROM v1_talks WHERE speaker_slug = ? AND year = ?", sp.get("slug"), y);
-              sp.put("year", y);
-              sp.put("talks", talks);
-              sp.put("languages", uniq(talks, "languages"));
-              sp.put("topics", uniq(talks, "topics"));
-              sp.put("years", years(c, (String) sp.get("slug")));
-            }
-            send(ex, 200, wrap(speakers));
-            return;
-          }
-          send(ex, 200, wrap(query(c, "SELECT " + SPEAKER_COLS + " FROM v1_speakers ORDER BY last_name, first_name")));
-          return;
-        }
-        Matcher ys = Pattern.compile("^/v1/speakers/(\\d{4})/([^/]+)$").matcher(path);
-        if (ys.matches()) {
-          int y = Integer.parseInt(ys.group(1));
-          String slug = ys.group(2);
-          List<Map<String, Object>> rows = query(c, "SELECT " + SPEAKER_COLS + " FROM v1_speakers WHERE slug = ?", slug);
-          if (rows.isEmpty()) {
-            send(ex, 404, "{\"error\":\"not_found\"}");
-            return;
-          }
-          List<Map<String, Object>> talks =
-              query(c, "SELECT " + TALK_COLS + " FROM v1_talks WHERE speaker_slug = ? AND year = ?", slug, y);
-          if (talks.isEmpty()) {
-            send(ex, 404, "{\"error\":\"not_found\"}");
-            return;
-          }
-          Map<String, Object> sp = rows.get(0);
-          List<Integer> yrs = years(c, slug);
-          sp.put("year", y);
-          sp.put("talks", talks);
-          sp.put("years", yrs);
-          sp.put("other_years", yrs.stream().filter(n -> n != y).toList());
-          sp.put("languages", uniq(talks, "languages"));
-          sp.put("topics", uniq(talks, "topics"));
-          send(ex, 200, "{\"data\":" + json(sp) + "}");
-          return;
-        }
-        Matcher s = Pattern.compile("^/v1/speakers/([^/]+)$").matcher(path);
-        if (s.matches()) {
-          String slug = s.group(1);
-          List<Map<String, Object>> rows = query(c, "SELECT " + SPEAKER_COLS + " FROM v1_speakers WHERE slug = ?", slug);
-          if (rows.isEmpty()) {
-            send(ex, 404, "{\"error\":\"not_found\"}");
-            return;
-          }
-          Map<String, Object> sp = rows.get(0);
-          sp.put("talks", query(c, "SELECT " + TALK_COLS + " FROM v1_talks WHERE speaker_slug = ?", slug));
-          sp.put("years", years(c, slug));
-          send(ex, 200, "{\"data\":" + json(sp) + "}");
-          return;
-        }
-        if (path.equals("/v1/sponsors")) {
-          String year = param(qs, "year");
-          if (year != null) {
-            send(
-                ex,
-                200,
-                wrap(
-                    query(
-                        c,
-                        "SELECT " + YEAR_SPONSOR_COLS + " FROM v1_year_sponsors WHERE year = ? ORDER BY name",
-                        Integer.parseInt(year))));
-          } else {
-            send(ex, 200, wrap(query(c, "SELECT " + SPONSOR_COLS + " FROM v1_sponsors ORDER BY name")));
-          }
-          return;
-        }
-        Matcher ysp = Pattern.compile("^/v1/sponsors/(\\d{4})/([^/]+)$").matcher(path);
-        if (ysp.matches()) {
-          int y = Integer.parseInt(ysp.group(1));
-          String slug = ysp.group(2);
-          List<Map<String, Object>> rows =
-              query(c, "SELECT " + YEAR_SPONSOR_COLS + " FROM v1_year_sponsors WHERE year = ? AND slug = ?", y, slug);
-          if (rows.isEmpty()) {
-            send(ex, 404, "{\"error\":\"not_found\"}");
-            return;
-          }
-          Map<String, Object> row = rows.get(0);
-          List<Integer> yrs = sponsorYears(c, slug);
-          row.put("years", yrs);
-          row.put("other_years", yrs.stream().filter(n -> n != y).toList());
-          send(ex, 200, "{\"data\":" + json(row) + "}");
-          return;
-        }
-        Matcher sp = Pattern.compile("^/v1/sponsors/([^/]+)$").matcher(path);
-        if (sp.matches()) {
-          String slug = sp.group(1);
-          List<Map<String, Object>> rows = query(c, "SELECT " + SPONSOR_COLS + " FROM v1_sponsors WHERE slug = ?", slug);
-          if (rows.isEmpty()) {
-            send(ex, 404, "{\"error\":\"not_found\"}");
-            return;
-          }
-          Map<String, Object> row = rows.get(0);
-          row.put("sponsorships", query(c, "SELECT * FROM v1_sponsorships WHERE sponsor_slug = ?", slug));
-          send(ex, 200, "{\"data\":" + json(row) + "}");
-          return;
-        }
-      }
-      send(ex, 404, "{\"error\":\"not_found\"}");
+      send(ex, result.status, result.body);
     } catch (Exception e) {
       try {
-        send(ex, 500, "{\"error\":" + quote(e.getMessage()) + "}");
+        send(ex, 500, "{\"error\":" + quote(String.valueOf(e.getMessage())) + "}");
       } catch (Exception ignored) {
       }
     }
   }
 
+  static HttpResult dispatch(String path, String qs) {
+    try {
+      path = path.replaceAll("/$", "");
+      if (path.isEmpty()) {
+        path = "/";
+      }
+      if (qs == null) {
+        qs = "";
+      }
+      if (path.equals("/")) {
+        return new HttpResult(200, identity());
+      }
+      if (path.equals("/health")) {
+        return new HttpResult(200, "{\"ok\":true}");
+      }
+      Connection c = acquire();
+      try {
+        return catalog(c, path, qs);
+      } finally {
+        release(c);
+      }
+    } catch (Exception e) {
+      return new HttpResult(500, "{\"error\":" + quote(String.valueOf(e.getMessage())) + "}");
+    }
+  }
+
+  static HttpResult catalog(Connection c, String path, String qs) throws Exception {
+    if (path.equals("/v1/years")) {
+      return new HttpResult(200, wrap(query(c, "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC")));
+    }
+    if (path.equals("/v1/speakers")) {
+      String year = param(qs, "year");
+      Integer y = year == null ? null : Integer.parseInt(year);
+      return new HttpResult(200, wrap(listSpeakers(c, y)));
+    }
+    Matcher ys = Pattern.compile("^/v1/speakers/(\\d{4})/([^/]+)$").matcher(path);
+    if (ys.matches()) {
+      int y = Integer.parseInt(ys.group(1));
+      String slug = ys.group(2);
+      List<Map<String, Object>> rows = query(c, "SELECT " + SPEAKER_COLS + " FROM v1_speakers WHERE slug = ?", slug);
+      if (rows.isEmpty()) {
+        return new HttpResult(404, "{\"error\":\"not_found\"}");
+      }
+      List<Map<String, Object>> talks =
+          query(c, "SELECT " + TALK_COLS + " FROM v1_talks WHERE speaker_slug = ? AND year = ?", slug, y);
+      if (talks.isEmpty()) {
+        return new HttpResult(404, "{\"error\":\"not_found\"}");
+      }
+      Map<String, Object> sp = rows.get(0);
+      List<Integer> yrs = years(c, slug);
+      sp.put("year", y);
+      sp.put("talks", talks);
+      sp.put("years", yrs);
+      sp.put("other_years", yrs.stream().filter(n -> n != y).toList());
+      sp.put("languages", uniq(talks, "languages"));
+      sp.put("topics", uniq(talks, "topics"));
+      return new HttpResult(200, "{\"data\":" + json(sp) + "}");
+    }
+    Matcher s = Pattern.compile("^/v1/speakers/([^/]+)$").matcher(path);
+    if (s.matches()) {
+      String slug = s.group(1);
+      List<Map<String, Object>> rows = query(c, "SELECT " + SPEAKER_COLS + " FROM v1_speakers WHERE slug = ?", slug);
+      if (rows.isEmpty()) {
+        return new HttpResult(404, "{\"error\":\"not_found\"}");
+      }
+      Map<String, Object> sp = rows.get(0);
+      sp.put("talks", query(c, "SELECT " + TALK_COLS + " FROM v1_talks WHERE speaker_slug = ?", slug));
+      sp.put("years", years(c, slug));
+      return new HttpResult(200, "{\"data\":" + json(sp) + "}");
+    }
+    if (path.equals("/v1/sponsors")) {
+      String year = param(qs, "year");
+      if (year != null) {
+        return new HttpResult(
+            200,
+            wrap(
+                query(
+                    c,
+                    "SELECT " + YEAR_SPONSOR_COLS + " FROM v1_year_sponsors WHERE year = ? ORDER BY name",
+                    Integer.parseInt(year))));
+      }
+      return new HttpResult(200, wrap(query(c, "SELECT " + SPONSOR_COLS + " FROM v1_sponsors ORDER BY name")));
+    }
+    Matcher ysp = Pattern.compile("^/v1/sponsors/(\\d{4})/([^/]+)$").matcher(path);
+    if (ysp.matches()) {
+      int y = Integer.parseInt(ysp.group(1));
+      String slug = ysp.group(2);
+      List<Map<String, Object>> rows =
+          query(c, "SELECT " + YEAR_SPONSOR_COLS + " FROM v1_year_sponsors WHERE year = ? AND slug = ?", y, slug);
+      if (rows.isEmpty()) {
+        return new HttpResult(404, "{\"error\":\"not_found\"}");
+      }
+      Map<String, Object> row = rows.get(0);
+      List<Integer> yrs = sponsorYears(c, slug);
+      row.put("years", yrs);
+      row.put("other_years", yrs.stream().filter(n -> n != y).toList());
+      return new HttpResult(200, "{\"data\":" + json(row) + "}");
+    }
+    Matcher sp = Pattern.compile("^/v1/sponsors/([^/]+)$").matcher(path);
+    if (sp.matches()) {
+      String slug = sp.group(1);
+      List<Map<String, Object>> rows = query(c, "SELECT " + SPONSOR_COLS + " FROM v1_sponsors WHERE slug = ?", slug);
+      if (rows.isEmpty()) {
+        return new HttpResult(404, "{\"error\":\"not_found\"}");
+      }
+      Map<String, Object> row = rows.get(0);
+      row.put("sponsorships", query(c, "SELECT * FROM v1_sponsorships WHERE sponsor_slug = ?", slug));
+      return new HttpResult(200, "{\"data\":" + json(row) + "}");
+    }
+    return new HttpResult(404, "{\"error\":\"not_found\"}");
+  }
+
+  static List<Map<String, Object>> listSpeakers(Connection c, Integer year) throws SQLException {
+    String sql = "SELECT " + SPEAKER_COLS + " FROM v1_speakers";
+    List<Map<String, Object>> speakers;
+    if (year != null) {
+      speakers =
+          query(
+              c,
+              sql + " WHERE slug IN (SELECT speaker_slug FROM v1_talks WHERE year = ?) ORDER BY last_name, first_name",
+              year);
+      return attachYearTags(c, speakers, year);
+    }
+    return query(c, sql + " ORDER BY last_name, first_name");
+  }
+
+  static List<Map<String, Object>> attachYearTags(
+      Connection c, List<Map<String, Object>> speakers, int year) throws SQLException {
+    if (speakers.isEmpty()) {
+      return speakers;
+    }
+    Map<String, List<Map<String, Object>>> talksBy = loadTalksForYear(c, year);
+    List<String> slugs = new ArrayList<>();
+    for (Map<String, Object> speaker : speakers) {
+      slugs.add(String.valueOf(speaker.get("slug")));
+    }
+    Map<String, List<Integer>> yearsBy = loadYearsForSlugs(c, slugs);
+    for (Map<String, Object> speaker : speakers) {
+      String slug = String.valueOf(speaker.get("slug"));
+      List<Map<String, Object>> talks = talksBy.getOrDefault(slug, List.of());
+      List<Integer> yrs = yearsBy.getOrDefault(slug, List.of());
+      speaker.put("year", year);
+      speaker.put("talks", talks);
+      speaker.put("languages", uniq(talks, "languages"));
+      speaker.put("topics", uniq(talks, "topics"));
+      speaker.put("years", yrs);
+    }
+    return speakers;
+  }
+
+  static Map<String, List<Map<String, Object>>> loadTalksForYear(Connection c, int year) throws SQLException {
+    Map<String, List<Map<String, Object>>> out = new LinkedHashMap<>();
+    for (Map<String, Object> talk :
+        query(c, "SELECT " + TALK_COLS + " FROM v1_talks WHERE year = ? ORDER BY speaker_slug, year DESC", year)) {
+      String slug = String.valueOf(talk.get("speaker_slug"));
+      out.computeIfAbsent(slug, k -> new ArrayList<>()).add(talk);
+    }
+    return out;
+  }
+
+  static Map<String, List<Integer>> loadYearsForSlugs(Connection c, List<String> slugs) throws SQLException {
+    Map<String, List<Integer>> out = new LinkedHashMap<>();
+    if (slugs.isEmpty()) {
+      return out;
+    }
+    for (Map<String, Object> row :
+        query(
+            c,
+            "SELECT DISTINCT speaker_slug, year FROM v1_talks WHERE speaker_slug = ANY(?::text[]) ORDER BY speaker_slug, year DESC",
+            (Object) slugs.toArray(new String[0]))) {
+      String slug = String.valueOf(row.get("speaker_slug"));
+      out.computeIfAbsent(slug, k -> new ArrayList<>()).add(asInt(row.get("year")));
+    }
+    return out;
+  }
+
+  static int asInt(Object y) {
+    if (y instanceof Number n) {
+      return n.intValue();
+    }
+    return Integer.parseInt(String.valueOf(y));
+  }
+
   static List<Integer> years(Connection c, String slug) throws SQLException {
     List<Integer> out = new ArrayList<>();
-    try (PreparedStatement ps =
-        c.prepareStatement("SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = ? ORDER BY year DESC")) {
-      ps.setString(1, slug);
-      try (ResultSet rs = ps.executeQuery()) {
-        while (rs.next()) out.add(rs.getInt(1));
-      }
+    for (Map<String, Object> row :
+        query(c, "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = ? ORDER BY year DESC", slug)) {
+      out.add(asInt(row.get("year")));
     }
     return out;
   }
 
   static List<Integer> sponsorYears(Connection c, String slug) throws SQLException {
     List<Integer> out = new ArrayList<>();
-    try (PreparedStatement ps =
-        c.prepareStatement("SELECT DISTINCT year FROM v1_sponsorships WHERE sponsor_slug = ? ORDER BY year DESC")) {
-      ps.setString(1, slug);
-      try (ResultSet rs = ps.executeQuery()) {
-        while (rs.next()) out.add(rs.getInt(1));
-      }
+    for (Map<String, Object> row :
+        query(c, "SELECT DISTINCT year FROM v1_sponsorships WHERE sponsor_slug = ? ORDER BY year DESC", slug)) {
+      out.add(asInt(row.get("year")));
     }
     return out;
   }
@@ -247,19 +413,28 @@ public class Main {
     for (Map<String, Object> t : talks) {
       Object v = t.get(key);
       if (v instanceof List<?> list) {
-        for (Object item : list) if (item != null && !item.toString().isEmpty()) set.add(item.toString());
+        for (Object item : list) {
+          if (item != null && !item.toString().isEmpty()) {
+            set.add(item.toString());
+          }
+        }
       }
     }
     return new ArrayList<>(set);
   }
 
   static List<Map<String, Object>> query(Connection c, String sql, Object... args) throws SQLException {
+    sqlCount.incrementAndGet();
+    if (queryFn != null) {
+      return queryFn.query(sql, args);
+    }
+    if (c == null) {
+      throw new SQLException("no connection");
+    }
     List<Map<String, Object>> rows = new ArrayList<>();
     try (PreparedStatement ps = c.prepareStatement(sql)) {
       for (int i = 0; i < args.length; i++) {
-        Object a = args[i];
-        if (a instanceof Integer iarg) ps.setInt(i + 1, iarg);
-        else ps.setString(i + 1, String.valueOf(a));
+        bind(ps, c, i + 1, args[i]);
       }
       try (ResultSet rs = ps.executeQuery()) {
         ResultSetMetaData md = rs.getMetaData();
@@ -268,8 +443,11 @@ public class Main {
           Map<String, Object> row = new LinkedHashMap<>();
           for (int i = 1; i <= n; i++) {
             Object v = rs.getObject(i);
-            if (v instanceof Array arr) v = Arrays.asList((Object[]) arr.getArray());
-            else if (v instanceof PGobject pg && "json".equals(pg.getType())) v = pg.getValue();
+            if (v instanceof Array arr) {
+              v = Arrays.asList((Object[]) arr.getArray());
+            } else if (v instanceof PGobject pg && "json".equals(pg.getType())) {
+              v = pg.getValue();
+            }
             row.put(md.getColumnLabel(i), v);
           }
           rows.add(row);
@@ -279,10 +457,26 @@ public class Main {
     return rows;
   }
 
+  static void bind(PreparedStatement ps, Connection c, int idx, Object a) throws SQLException {
+    if (a instanceof Integer iarg) {
+      ps.setInt(idx, iarg);
+    } else if (a instanceof Long larg) {
+      ps.setLong(idx, larg);
+    } else if (a instanceof String[] sarr) {
+      ps.setArray(idx, c.createArrayOf("text", sarr));
+    } else if (a instanceof List<?> list) {
+      ps.setArray(idx, c.createArrayOf("text", list.toArray()));
+    } else {
+      ps.setString(idx, String.valueOf(a));
+    }
+  }
+
   static String param(String qs, String name) {
     for (String part : qs.split("&")) {
       String[] kv = part.split("=", 2);
-      if (kv.length == 2 && kv[0].equals(name)) return kv[1];
+      if (kv.length == 2 && kv[0].equals(name)) {
+        return kv[1];
+      }
     }
     return null;
   }
@@ -292,16 +486,24 @@ public class Main {
   }
 
   static String json(Object o) {
-    if (o == null) return "null";
-    if (o instanceof Number || o instanceof Boolean) return o.toString();
-    if (o instanceof String s) return quote(s);
+    if (o == null) {
+      return "null";
+    }
+    if (o instanceof Number || o instanceof Boolean) {
+      return o.toString();
+    }
+    if (o instanceof String s) {
+      return quote(s);
+    }
     if (o instanceof Object[] arr) {
       return json(Arrays.asList(arr));
     }
     if (o instanceof List<?> list) {
       StringBuilder sb = new StringBuilder("[");
       for (int i = 0; i < list.size(); i++) {
-        if (i > 0) sb.append(',');
+        if (i > 0) {
+          sb.append(',');
+        }
         sb.append(json(list.get(i)));
       }
       return sb.append(']').toString();
@@ -310,7 +512,9 @@ public class Main {
       StringBuilder sb = new StringBuilder("{");
       int i = 0;
       for (Map.Entry<?, ?> e : map.entrySet()) {
-        if (i++ > 0) sb.append(',');
+        if (i++ > 0) {
+          sb.append(',');
+        }
         sb.append(quote(String.valueOf(e.getKey()))).append(':').append(json(e.getValue()));
       }
       return sb.append('}').toString();
@@ -348,7 +552,9 @@ public class Main {
   static void register(int port) {
     String url = System.getenv("CAROLINA_URL");
     String token = System.getenv("POLYGLOT_REGISTER_TOKEN");
-    if (url == null || token == null || url.isBlank() || token.isBlank()) return;
+    if (url == null || token == null || url.isBlank() || token.isBlank()) {
+      return;
+    }
     String base = Optional.ofNullable(System.getenv("PUBLIC_BASE_URL")).orElse("http://127.0.0.1:" + port);
     Map<String, Object> payload = new LinkedHashMap<>();
     payload.put("language", LANGUAGE);
