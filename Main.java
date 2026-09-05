@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -59,7 +60,13 @@ public class Main {
   static final String TALK_COLS =
       "slug, title, description, format, youtube_id, year, speaker_slug, languages, topics";
 
+  static final Pattern SPEAKER_YEAR_SLUG = Pattern.compile("^/v1/speakers/(\\d{4})/([^/]+)$");
+  static final Pattern SPEAKER_SLUG = Pattern.compile("^/v1/speakers/([^/]+)$");
+  static final Pattern SPONSOR_YEAR_SLUG = Pattern.compile("^/v1/sponsors/(\\d{4})/([^/]+)$");
+  static final Pattern SPONSOR_SLUG = Pattern.compile("^/v1/sponsors/([^/]+)$");
+
   static final int POOL_SIZE = 8;
+  static final int POOL_WAIT_MS = 10_000;
   static final Object poolLock = new Object();
   static final ArrayDeque<Connection> idle = new ArrayDeque<>();
   static int poolOpened;
@@ -67,6 +74,8 @@ public class Main {
 
   static final AtomicInteger sqlCount = new AtomicInteger();
   static final AtomicInteger connectCount = new AtomicInteger();
+
+  static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
 
   interface ConnectFn {
     Connection open() throws Exception;
@@ -89,16 +98,46 @@ public class Main {
     }
   }
 
+  static final class Payload {
+    final int status;
+    final Object data;
+    final String error;
+
+    Payload(int status, Object data, String error) {
+      this.status = status;
+      this.data = data;
+      this.error = error;
+    }
+
+    static Payload ok(Object data) {
+      return new Payload(200, data, null);
+    }
+
+    static Payload notFound() {
+      return new Payload(404, null, "not_found");
+    }
+
+    HttpResult toResult() {
+      if (error != null) {
+        return new HttpResult(status, "{\"error\":" + quote(error) + "}");
+      }
+      if (data instanceof List<?> list) {
+        return new HttpResult(status, "{\"data\":" + json(list) + "}");
+      }
+      return new HttpResult(status, "{\"data\":" + json(data) + "}");
+    }
+  }
+
   public static void main(String[] args) throws Exception {
     Class.forName("org.postgresql.Driver");
     openPool();
     int port = Integer.parseInt(System.getenv().getOrDefault("PORT", "4007"));
     HttpServer server = HttpServer.create(listenAddress(port), 0);
     server.createContext("/", Main::handle);
-    server.setExecutor(Executors.newCachedThreadPool());
+    server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
     server.start();
     System.err.println("carolina-codes-java listening on :" + port);
-    register(port);
+    Thread.startVirtualThread(() -> register(port));
   }
 
   static String listenHost() {
@@ -142,7 +181,18 @@ public class Main {
     if (!jdbc.contains("ssl=")) {
       jdbc += "&ssl=false";
     }
+    jdbc = appendParam(jdbc, "tcpKeepAlive", "true");
+    jdbc = appendParam(jdbc, "connectTimeout", "10");
+    jdbc = appendParam(jdbc, "socketTimeout", "30");
+    jdbc = appendParam(jdbc, "ApplicationName", "carolina-codes-java");
     return DriverManager.getConnection(jdbc, user, pass);
+  }
+
+  static String appendParam(String jdbc, String key, String value) {
+    if (jdbc.contains(key + "=")) {
+      return jdbc;
+    }
+    return jdbc + (jdbc.contains("?") ? "&" : "?") + key + "=" + value;
   }
 
   static Connection openConnection() throws Exception {
@@ -169,15 +219,70 @@ public class Main {
       if (!poolReady) {
         openPool();
       }
-      while (true) {
-        if (!idle.isEmpty()) {
-          return idle.removeFirst();
+    }
+    long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(POOL_WAIT_MS);
+    while (true) {
+      Connection c = takeIdleOrGrow();
+      if (c != null) {
+        if (usable(c)) {
+          return c;
         }
-        if (poolOpened < POOL_SIZE) {
-          poolOpened++;
-          return openConnection();
+        discardBroken(c);
+        continue;
+      }
+      long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+      if (remainingMs <= 0) {
+        throw new SQLException("connection pool exhausted");
+      }
+      synchronized (poolLock) {
+        if (idle.isEmpty() && poolOpened >= POOL_SIZE) {
+          poolLock.wait(remainingMs);
         }
-        poolLock.wait();
+      }
+    }
+  }
+
+  static Connection takeIdleOrGrow() throws Exception {
+    synchronized (poolLock) {
+      if (!idle.isEmpty()) {
+        return idle.removeFirst();
+      }
+      if (poolOpened < POOL_SIZE) {
+        poolOpened++;
+      } else {
+        return null;
+      }
+    }
+    try {
+      return openConnection();
+    } catch (Exception e) {
+      synchronized (poolLock) {
+        poolOpened--;
+        poolLock.notify();
+      }
+      throw e;
+    }
+  }
+
+  static boolean usable(Connection c) {
+    if (c == null) {
+      return connectFn != null;
+    }
+    try {
+      return !c.isClosed() && c.isValid(1);
+    } catch (SQLException e) {
+      return false;
+    }
+  }
+
+  static void discardBroken(Connection c) {
+    synchronized (poolLock) {
+      poolOpened = Math.max(0, poolOpened - 1);
+    }
+    if (c != null) {
+      try {
+        c.close();
+      } catch (Exception ignored) {
       }
     }
   }
@@ -207,9 +312,20 @@ public class Main {
     }
   }
 
+  static String trimSlash(String path) {
+    if (path == null || path.isEmpty()) {
+      return "/";
+    }
+    int end = path.length();
+    while (end > 1 && path.charAt(end - 1) == '/') {
+      end--;
+    }
+    return end == path.length() ? path : path.substring(0, end);
+  }
+
   static HttpResult dispatch(String path, String qs) {
     try {
-      path = path.replaceAll("/$", "");
+      path = trimSlash(path);
       if (path.isEmpty()) {
         path = "/";
       }
@@ -222,38 +338,40 @@ public class Main {
       if (path.equals("/health")) {
         return new HttpResult(200, "{\"ok\":true}");
       }
+      Payload payload;
       Connection c = acquire();
       try {
-        return catalog(c, path, qs);
+        payload = catalog(c, path, qs);
       } finally {
         release(c);
       }
+      return payload.toResult();
     } catch (Exception e) {
       return new HttpResult(500, "{\"error\":" + quote(String.valueOf(e.getMessage())) + "}");
     }
   }
 
-  static HttpResult catalog(Connection c, String path, String qs) throws Exception {
+  static Payload catalog(Connection c, String path, String qs) throws Exception {
     if (path.equals("/v1/years")) {
-      return new HttpResult(200, wrap(query(c, "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC")));
+      return Payload.ok(query(c, "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC"));
     }
     if (path.equals("/v1/speakers")) {
       String year = param(qs, "year");
       Integer y = year == null ? null : Integer.parseInt(year);
-      return new HttpResult(200, wrap(listSpeakers(c, y)));
+      return Payload.ok(listSpeakers(c, y));
     }
-    Matcher ys = Pattern.compile("^/v1/speakers/(\\d{4})/([^/]+)$").matcher(path);
+    Matcher ys = SPEAKER_YEAR_SLUG.matcher(path);
     if (ys.matches()) {
       int y = Integer.parseInt(ys.group(1));
       String slug = ys.group(2);
       List<Map<String, Object>> rows = query(c, "SELECT " + SPEAKER_COLS + " FROM v1_speakers WHERE slug = ?", slug);
       if (rows.isEmpty()) {
-        return new HttpResult(404, "{\"error\":\"not_found\"}");
+        return Payload.notFound();
       }
       List<Map<String, Object>> talks =
           query(c, "SELECT " + TALK_COLS + " FROM v1_talks WHERE speaker_slug = ? AND year = ?", slug, y);
       if (talks.isEmpty()) {
-        return new HttpResult(404, "{\"error\":\"not_found\"}");
+        return Payload.notFound();
       }
       Map<String, Object> sp = rows.get(0);
       List<Integer> yrs = years(c, slug);
@@ -263,60 +381,58 @@ public class Main {
       sp.put("other_years", yrs.stream().filter(n -> n != y).toList());
       sp.put("languages", uniq(talks, "languages"));
       sp.put("topics", uniq(talks, "topics"));
-      return new HttpResult(200, "{\"data\":" + json(sp) + "}");
+      return Payload.ok(sp);
     }
-    Matcher s = Pattern.compile("^/v1/speakers/([^/]+)$").matcher(path);
+    Matcher s = SPEAKER_SLUG.matcher(path);
     if (s.matches()) {
       String slug = s.group(1);
       List<Map<String, Object>> rows = query(c, "SELECT " + SPEAKER_COLS + " FROM v1_speakers WHERE slug = ?", slug);
       if (rows.isEmpty()) {
-        return new HttpResult(404, "{\"error\":\"not_found\"}");
+        return Payload.notFound();
       }
       Map<String, Object> sp = rows.get(0);
       sp.put("talks", query(c, "SELECT " + TALK_COLS + " FROM v1_talks WHERE speaker_slug = ?", slug));
       sp.put("years", years(c, slug));
-      return new HttpResult(200, "{\"data\":" + json(sp) + "}");
+      return Payload.ok(sp);
     }
     if (path.equals("/v1/sponsors")) {
       String year = param(qs, "year");
       if (year != null) {
-        return new HttpResult(
-            200,
-            wrap(
-                query(
-                    c,
-                    "SELECT " + YEAR_SPONSOR_COLS + " FROM v1_year_sponsors WHERE year = ? ORDER BY name",
-                    Integer.parseInt(year))));
+        return Payload.ok(
+            query(
+                c,
+                "SELECT " + YEAR_SPONSOR_COLS + " FROM v1_year_sponsors WHERE year = ? ORDER BY name",
+                Integer.parseInt(year)));
       }
-      return new HttpResult(200, wrap(query(c, "SELECT " + SPONSOR_COLS + " FROM v1_sponsors ORDER BY name")));
+      return Payload.ok(query(c, "SELECT " + SPONSOR_COLS + " FROM v1_sponsors ORDER BY name"));
     }
-    Matcher ysp = Pattern.compile("^/v1/sponsors/(\\d{4})/([^/]+)$").matcher(path);
+    Matcher ysp = SPONSOR_YEAR_SLUG.matcher(path);
     if (ysp.matches()) {
       int y = Integer.parseInt(ysp.group(1));
       String slug = ysp.group(2);
       List<Map<String, Object>> rows =
           query(c, "SELECT " + YEAR_SPONSOR_COLS + " FROM v1_year_sponsors WHERE year = ? AND slug = ?", y, slug);
       if (rows.isEmpty()) {
-        return new HttpResult(404, "{\"error\":\"not_found\"}");
+        return Payload.notFound();
       }
       Map<String, Object> row = rows.get(0);
       List<Integer> yrs = sponsorYears(c, slug);
       row.put("years", yrs);
       row.put("other_years", yrs.stream().filter(n -> n != y).toList());
-      return new HttpResult(200, "{\"data\":" + json(row) + "}");
+      return Payload.ok(row);
     }
-    Matcher sp = Pattern.compile("^/v1/sponsors/([^/]+)$").matcher(path);
+    Matcher sp = SPONSOR_SLUG.matcher(path);
     if (sp.matches()) {
       String slug = sp.group(1);
       List<Map<String, Object>> rows = query(c, "SELECT " + SPONSOR_COLS + " FROM v1_sponsors WHERE slug = ?", slug);
       if (rows.isEmpty()) {
-        return new HttpResult(404, "{\"error\":\"not_found\"}");
+        return Payload.notFound();
       }
       Map<String, Object> row = rows.get(0);
       row.put("sponsorships", query(c, "SELECT * FROM v1_sponsorships WHERE sponsor_slug = ?", slug));
-      return new HttpResult(200, "{\"data\":" + json(row) + "}");
+      return Payload.ok(row);
     }
-    return new HttpResult(404, "{\"error\":\"not_found\"}");
+    return Payload.notFound();
   }
 
   static List<Map<String, Object>> listSpeakers(Connection c, Integer year) throws SQLException {
@@ -439,16 +555,20 @@ public class Main {
       try (ResultSet rs = ps.executeQuery()) {
         ResultSetMetaData md = rs.getMetaData();
         int n = md.getColumnCount();
+        String[] labels = new String[n];
+        for (int i = 0; i < n; i++) {
+          labels[i] = md.getColumnLabel(i + 1);
+        }
         while (rs.next()) {
           Map<String, Object> row = new LinkedHashMap<>();
-          for (int i = 1; i <= n; i++) {
-            Object v = rs.getObject(i);
+          for (int i = 0; i < n; i++) {
+            Object v = rs.getObject(i + 1);
             if (v instanceof Array arr) {
               v = Arrays.asList((Object[]) arr.getArray());
             } else if (v instanceof PGobject pg && "json".equals(pg.getType())) {
               v = pg.getValue();
             }
-            row.put(md.getColumnLabel(i), v);
+            row.put(labels[i], v);
           }
           rows.add(row);
         }
@@ -479,10 +599,6 @@ public class Main {
       }
     }
     return null;
-  }
-
-  static String wrap(List<Map<String, Object>> rows) {
-    return "{\"data\":" + json(rows) + "}";
   }
 
   static String json(Object o) {
@@ -566,16 +682,19 @@ public class Main {
     payload.put("base_url", base);
     payload.put("endpoints", ENDPOINTS);
     String body = json(payload);
+    String root = url;
+    while (root.endsWith("/")) {
+      root = root.substring(0, root.length() - 1);
+    }
     try {
-      HttpClient.newHttpClient()
-          .send(
-              HttpRequest.newBuilder(URI.create(url.replaceAll("/$", "") + "/internal/api-endpoints/register"))
-                  .timeout(Duration.ofSeconds(5))
-                  .header("Authorization", "Bearer " + token)
-                  .header("Content-Type", "application/json")
-                  .POST(HttpRequest.BodyPublishers.ofString(body))
-                  .build(),
-              HttpResponse.BodyHandlers.discarding());
+      HTTP.send(
+          HttpRequest.newBuilder(URI.create(root + "/internal/api-endpoints/register"))
+              .timeout(Duration.ofSeconds(5))
+              .header("Authorization", "Bearer " + token)
+              .header("Content-Type", "application/json")
+              .POST(HttpRequest.BodyPublishers.ofString(body))
+              .build(),
+          HttpResponse.BodyHandlers.discarding());
     } catch (Exception e) {
       System.err.println("register: " + e.getMessage());
     }

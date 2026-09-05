@@ -1,8 +1,11 @@
 import com.sun.net.httpserver.HttpServer;
+import java.lang.reflect.Proxy;
 import java.net.Inet6Address;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Connection;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
@@ -86,6 +89,14 @@ public class PerfTest {
     expect(!src.contains("\"0.0.0.0\""), "source does not bind 0.0.0.0");
     expect(src.contains("listenAddress(port)"), "main uses listenAddress(port)");
     expect(src.contains("sslmode=disable"), "JDBC keeps sslmode=disable");
+    expect(src.contains("tcpKeepAlive"), "JDBC enables tcpKeepAlive");
+    expect(src.contains("connectTimeout"), "JDBC sets connectTimeout");
+    expect(src.contains("isValid("), "pool validates connections on checkout");
+    expect(src.contains("newVirtualThreadPerTaskExecutor()"), "HTTP executor uses virtual threads");
+    expect(src.contains("startVirtualThread"), "register runs off the main thread");
+    expect(src.contains("static final Pattern SPEAKER_YEAR_SLUG"), "speaker year/slug pattern is static");
+    expect(src.contains("static final Pattern SPONSOR_YEAR_SLUG"), "sponsor year/slug pattern is static");
+    expect(src.contains("payload.toResult()"), "JSON serialization happens after pool release");
 
     HttpServer bound = HttpServer.create(Main.listenAddress(0), 0);
     bound.start();
@@ -125,14 +136,14 @@ public class PerfTest {
             List<Map<String, Object>> rows = new ArrayList<>();
             if (sql.contains("FROM v1_speakers")) {
               for (int i = 0; i < 3; i++) {
-                rows.add(Map.of("slug", "s" + i, "first_name", "A", "last_name", "B"));
+                rows.add(row("slug", "s" + i, "first_name", "A", "last_name", "B"));
               }
             } else if (sql.contains("ANY(")) {
-              rows.add(Map.of("speaker_slug", "s0", "year", 2026));
-              rows.add(Map.of("speaker_slug", "s0", "year", 2024));
+              rows.add(row("speaker_slug", "s0", "year", 2026));
+              rows.add(row("speaker_slug", "s0", "year", 2024));
             } else if (sql.contains("FROM v1_talks")) {
               rows.add(
-                  Map.of(
+                  row(
                       "slug",
                       "t0",
                       "title",
@@ -149,7 +160,7 @@ public class PerfTest {
             return rows;
           };
       Main.poolReady = true;
-      Main.idle.add(null);
+      Main.idle.addLast(stubConnection());
       Main.poolOpened = 1;
       Main.connectCount.set(1);
     }
@@ -205,6 +216,29 @@ public class PerfTest {
       System.exit(1);
     }
     System.err.println("perf_test passed");
+  }
+
+  static Map<String, Object> row(Object... kv) {
+    Map<String, Object> out = new LinkedHashMap<>();
+    for (int i = 0; i < kv.length; i += 2) {
+      out.put(String.valueOf(kv[i]), kv[i + 1]);
+    }
+    return out;
+  }
+
+  static Connection stubConnection() {
+    return (Connection)
+        Proxy.newProxyInstance(
+            Connection.class.getClassLoader(),
+            new Class<?>[] {Connection.class},
+            (proxy, method, args) -> {
+              return switch (method.getName()) {
+                case "isValid" -> true;
+                case "isClosed" -> false;
+                case "close" -> null;
+                default -> null;
+              };
+            });
   }
 
   static final class ConnectionHolder {
