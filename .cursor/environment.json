@@ -1,0 +1,14 @@
+{
+  "name": "carolina-codes-java",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "install": "mkdir -p lib && curl -fsSL -o lib/postgresql-42.7.7.jar https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.7/postgresql-42.7.7.jar && javac -cp lib/postgresql-42.7.7.jar Main.java",
+  "ports": [
+    {
+      "name": "api",
+      "port": 4007
+    }
+  ]
+}
