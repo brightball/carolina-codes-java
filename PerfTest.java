@@ -97,6 +97,8 @@ public class PerfTest {
     String runtime = System.getProperty("java.version");
     expect("27".equals(majorOf(runtime)), "java.version major is 27, got " + runtime);
     assertGiteaWorkflowGraph();
+    assertChecksumsStayOffStdout(Path.of("scripts/java-home.sh"));
+    assertChecksumsStayOffStdout(Path.of("scripts/tools.sh"));
 
     expect("::".equals(Main.listenHost()), "listen host is ::");
     String src = Files.readString(Path.of("Main.java"));
@@ -298,6 +300,21 @@ public class PerfTest {
           !body.contains("github.com/google/google-java-format"),
           name + " does not fetch google-java-format");
     }
+  }
+
+  static void assertChecksumsStayOffStdout(Path script) throws Exception {
+    expect(Files.isRegularFile(script), "shipped " + script + " exists");
+    String src = Files.readString(script);
+    Matcher m = Pattern.compile("(?m)^.*sha256sum -c.*$").matcher(src);
+    boolean found = false;
+    while (m.find()) {
+      found = true;
+      String line = m.group();
+      expect(
+          line.contains(">/dev/null") || line.contains(">&2"),
+          script + " sha256sum must not write to stdout: " + line.trim());
+    }
+    expect(found, script + " verifies downloads with sha256sum -c");
   }
 
   static boolean jobRunsMake(String body, String target) {

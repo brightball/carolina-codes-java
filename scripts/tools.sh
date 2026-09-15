@@ -24,7 +24,7 @@ fetch() {
   fi
   echo "fetch ${url}" >&2
   curl -fsSL -o "${dest}.part" "$url"
-  echo "${sha}  ${dest}.part" | sha256sum -c -
+  echo "${sha}  ${dest}.part" | sha256sum -c - >&2
   mv "${dest}.part" "$dest"
 }
 

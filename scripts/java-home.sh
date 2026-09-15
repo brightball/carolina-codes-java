@@ -51,7 +51,7 @@ tarball="${ROOT}/.tools/openjdk-27.tar.gz"
 url="https://download.java.net/java/GA/jdk27/55ce5470a6294008af0057ff4626d0e5/35/GPL/openjdk-27_linux-${jarch}_bin.tar.gz"
 echo "installing JDK 27 to ${dest}" >&2
 curl -fsSL -o "${tarball}.part" "$url"
-echo "${sha}  ${tarball}.part" | sha256sum -c -
+echo "${sha}  ${tarball}.part" | sha256sum -c - >&2
 mv "${tarball}.part" "$tarball"
 rm -rf "$dest"
 mkdir -p "$dest"
