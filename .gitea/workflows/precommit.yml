@@ -1,0 +1,133 @@
+# One Gitea Actions job per pre-commit check. Not a single combined job.
+#
+# act_runner starts a new container per job (no live image, valid_volumes
+# empty so host bind-mounts are blocked). Gitea git HTTP is 401 without
+# the job token; do not git init or set init.defaultBranch. debian:bookworm-slim
+# has no Node, so prepare apt-gets nodejs and the shared OS packages, clones
+# GITHUB_SHA, fetches JDK 27 + PMD/osv/gitleaks/GJF into .tools, and uploads
+# a workspace tarball that keeps .git (gitleaks). Check jobs restore that
+# artifact; they apt-get nodejs only so actions/download-artifact@v3 can run,
+# plus make/unzip to invoke the check — they do not clone or fetch JDK/tools.
+# Java jobs install JDK 27 the same way the Dockerfile does (no Temurin 27).
+name: precommit
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: precommit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITHUB_TOKEN: ${{ github.token }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/debian:bookworm-slim
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends git curl ca-certificates make unzip tar gzip nodejs
+      - run: |
+          set -euo pipefail
+          token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
+          if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
+          host="${GITHUB_SERVER_URL#https://}"
+          host="${host#http://}"
+          git clone --depth 1 --no-checkout "https://x-access-token:${token}@${host}/${GITHUB_REPOSITORY}" .
+          git fetch --depth 1 origin "${GITHUB_SHA}"
+          git checkout --force FETCH_HEAD
+          git remote set-url origin "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+      - run: make tools
+      - run: |
+          tar -czf /tmp/prep-workspace.tar.gz .
+          mv /tmp/prep-workspace.tar.gz prep-workspace.tar.gz
+      - uses: actions/upload-artifact@v3
+        with:
+          name: prep-workspace
+          path: prep-workspace.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  test:
+    needs: prepare
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/debian:bookworm-slim
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates nodejs make unzip
+      - uses: actions/download-artifact@v3
+        with:
+          name: prep-workspace
+      - run: |
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+      - run: make test
+
+  sast:
+    needs: prepare
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/debian:bookworm-slim
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates nodejs make unzip
+      - uses: actions/download-artifact@v3
+        with:
+          name: prep-workspace
+      - run: |
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+      - run: make sast
+
+  audit:
+    needs: prepare
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/debian:bookworm-slim
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates nodejs make unzip
+      - uses: actions/download-artifact@v3
+        with:
+          name: prep-workspace
+      - run: |
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+      - run: make audit
+
+  gitleaks:
+    needs: prepare
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/debian:bookworm-slim
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates nodejs make unzip
+      - uses: actions/download-artifact@v3
+        with:
+          name: prep-workspace
+      - run: |
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+      - run: make gitleaks
+
+  style:
+    needs: prepare
+    runs-on: ubuntu-latest
+    container:
+      image: docker.io/library/debian:bookworm-slim
+    steps:
+      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates nodejs make unzip
+      - uses: actions/download-artifact@v3
+        with:
+          name: prep-workspace
+      - run: |
+          archive="$(find . -name prep-workspace.tar.gz -print | head -1)"
+          test -n "$archive"
+          tar -xzf "$archive"
+      - run: make style

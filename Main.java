@@ -50,13 +50,17 @@ public class Main {
           endpoint("GET", "/v1/sponsors/:slug", List.of()),
           endpoint("GET", "/v1/sponsors/:year/:slug", List.of()));
   static final String DSN =
-      System.getenv().getOrDefault("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev");
+      System.getenv()
+          .getOrDefault("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:5432/carolina_dev");
   static final String SPEAKER_COLS =
-      "slug, first_name, last_name, name, tagline, bio, company, location, photo_path, twitter_url, linkedin_url, website_url, github_url, featured";
+      "slug, first_name, last_name, name, tagline, bio, company, location, photo_path, twitter_url,"
+          + " linkedin_url, website_url, github_url, featured";
   static final String YEAR_SPONSOR_COLS =
-      "slug, name, website, logo_path, description, blurb, tier, featured, year, twitter_url, linkedin_url, youtube_url, instagram_url, facebook_url";
+      "slug, name, website, logo_path, description, blurb, tier, featured, year, twitter_url,"
+          + " linkedin_url, youtube_url, instagram_url, facebook_url";
   static final String SPONSOR_COLS =
-      "slug, name, website, logo_path, description, twitter_url, linkedin_url, youtube_url, instagram_url, facebook_url";
+      "slug, name, website, logo_path, description, twitter_url, linkedin_url, youtube_url,"
+          + " instagram_url, facebook_url";
   static final String TALK_COLS =
       "slug, title, description, format, youtube_id, year, speaker_slug, languages, topics";
 
@@ -75,7 +79,8 @@ public class Main {
   static final AtomicInteger sqlCount = new AtomicInteger();
   static final AtomicInteger connectCount = new AtomicInteger();
 
-  static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
+  static final HttpClient HTTP =
+      HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
 
   interface ConnectFn {
     Connection open() throws Exception;
@@ -353,7 +358,8 @@ public class Main {
 
   static Payload catalog(Connection c, String path, String qs) throws Exception {
     if (path.equals("/v1/years")) {
-      return Payload.ok(query(c, "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC"));
+      return Payload.ok(
+          query(c, "SELECT year, slug, name, status FROM v1_years ORDER BY year DESC"));
     }
     if (path.equals("/v1/speakers")) {
       String year = param(qs, "year");
@@ -364,12 +370,17 @@ public class Main {
     if (ys.matches()) {
       int y = Integer.parseInt(ys.group(1));
       String slug = ys.group(2);
-      List<Map<String, Object>> rows = query(c, "SELECT " + SPEAKER_COLS + " FROM v1_speakers WHERE slug = ?", slug);
+      List<Map<String, Object>> rows =
+          query(c, "SELECT " + SPEAKER_COLS + " FROM v1_speakers WHERE slug = ?", slug);
       if (rows.isEmpty()) {
         return Payload.notFound();
       }
       List<Map<String, Object>> talks =
-          query(c, "SELECT " + TALK_COLS + " FROM v1_talks WHERE speaker_slug = ? AND year = ?", slug, y);
+          query(
+              c,
+              "SELECT " + TALK_COLS + " FROM v1_talks WHERE speaker_slug = ? AND year = ?",
+              slug,
+              y);
       if (talks.isEmpty()) {
         return Payload.notFound();
       }
@@ -386,12 +397,14 @@ public class Main {
     Matcher s = SPEAKER_SLUG.matcher(path);
     if (s.matches()) {
       String slug = s.group(1);
-      List<Map<String, Object>> rows = query(c, "SELECT " + SPEAKER_COLS + " FROM v1_speakers WHERE slug = ?", slug);
+      List<Map<String, Object>> rows =
+          query(c, "SELECT " + SPEAKER_COLS + " FROM v1_speakers WHERE slug = ?", slug);
       if (rows.isEmpty()) {
         return Payload.notFound();
       }
       Map<String, Object> sp = rows.get(0);
-      sp.put("talks", query(c, "SELECT " + TALK_COLS + " FROM v1_talks WHERE speaker_slug = ?", slug));
+      sp.put(
+          "talks", query(c, "SELECT " + TALK_COLS + " FROM v1_talks WHERE speaker_slug = ?", slug));
       sp.put("years", years(c, slug));
       return Payload.ok(sp);
     }
@@ -401,7 +414,9 @@ public class Main {
         return Payload.ok(
             query(
                 c,
-                "SELECT " + YEAR_SPONSOR_COLS + " FROM v1_year_sponsors WHERE year = ? ORDER BY name",
+                "SELECT "
+                    + YEAR_SPONSOR_COLS
+                    + " FROM v1_year_sponsors WHERE year = ? ORDER BY name",
                 Integer.parseInt(year)));
       }
       return Payload.ok(query(c, "SELECT " + SPONSOR_COLS + " FROM v1_sponsors ORDER BY name"));
@@ -411,7 +426,11 @@ public class Main {
       int y = Integer.parseInt(ysp.group(1));
       String slug = ysp.group(2);
       List<Map<String, Object>> rows =
-          query(c, "SELECT " + YEAR_SPONSOR_COLS + " FROM v1_year_sponsors WHERE year = ? AND slug = ?", y, slug);
+          query(
+              c,
+              "SELECT " + YEAR_SPONSOR_COLS + " FROM v1_year_sponsors WHERE year = ? AND slug = ?",
+              y,
+              slug);
       if (rows.isEmpty()) {
         return Payload.notFound();
       }
@@ -424,12 +443,14 @@ public class Main {
     Matcher sp = SPONSOR_SLUG.matcher(path);
     if (sp.matches()) {
       String slug = sp.group(1);
-      List<Map<String, Object>> rows = query(c, "SELECT " + SPONSOR_COLS + " FROM v1_sponsors WHERE slug = ?", slug);
+      List<Map<String, Object>> rows =
+          query(c, "SELECT " + SPONSOR_COLS + " FROM v1_sponsors WHERE slug = ?", slug);
       if (rows.isEmpty()) {
         return Payload.notFound();
       }
       Map<String, Object> row = rows.get(0);
-      row.put("sponsorships", query(c, "SELECT * FROM v1_sponsorships WHERE sponsor_slug = ?", slug));
+      row.put(
+          "sponsorships", query(c, "SELECT * FROM v1_sponsorships WHERE sponsor_slug = ?", slug));
       return Payload.ok(row);
     }
     return Payload.notFound();
@@ -442,7 +463,9 @@ public class Main {
       speakers =
           query(
               c,
-              sql + " WHERE slug IN (SELECT speaker_slug FROM v1_talks WHERE year = ?) ORDER BY last_name, first_name",
+              sql
+                  + " WHERE slug IN (SELECT speaker_slug FROM v1_talks WHERE year = ?) ORDER BY"
+                  + " last_name, first_name",
               year);
       return attachYearTags(c, speakers, year);
     }
@@ -473,17 +496,24 @@ public class Main {
     return speakers;
   }
 
-  static Map<String, List<Map<String, Object>>> loadTalksForYear(Connection c, int year) throws SQLException {
+  static Map<String, List<Map<String, Object>>> loadTalksForYear(Connection c, int year)
+      throws SQLException {
     Map<String, List<Map<String, Object>>> out = new LinkedHashMap<>();
     for (Map<String, Object> talk :
-        query(c, "SELECT " + TALK_COLS + " FROM v1_talks WHERE year = ? ORDER BY speaker_slug, year DESC", year)) {
+        query(
+            c,
+            "SELECT "
+                + TALK_COLS
+                + " FROM v1_talks WHERE year = ? ORDER BY speaker_slug, year DESC",
+            year)) {
       String slug = String.valueOf(talk.get("speaker_slug"));
       out.computeIfAbsent(slug, k -> new ArrayList<>()).add(talk);
     }
     return out;
   }
 
-  static Map<String, List<Integer>> loadYearsForSlugs(Connection c, List<String> slugs) throws SQLException {
+  static Map<String, List<Integer>> loadYearsForSlugs(Connection c, List<String> slugs)
+      throws SQLException {
     Map<String, List<Integer>> out = new LinkedHashMap<>();
     if (slugs.isEmpty()) {
       return out;
@@ -491,7 +521,8 @@ public class Main {
     for (Map<String, Object> row :
         query(
             c,
-            "SELECT DISTINCT speaker_slug, year FROM v1_talks WHERE speaker_slug = ANY(?::text[]) ORDER BY speaker_slug, year DESC",
+            "SELECT DISTINCT speaker_slug, year FROM v1_talks WHERE speaker_slug = ANY(?::text[])"
+                + " ORDER BY speaker_slug, year DESC",
             (Object) slugs.toArray(new String[0]))) {
       String slug = String.valueOf(row.get("speaker_slug"));
       out.computeIfAbsent(slug, k -> new ArrayList<>()).add(asInt(row.get("year")));
@@ -509,7 +540,10 @@ public class Main {
   static List<Integer> years(Connection c, String slug) throws SQLException {
     List<Integer> out = new ArrayList<>();
     for (Map<String, Object> row :
-        query(c, "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = ? ORDER BY year DESC", slug)) {
+        query(
+            c,
+            "SELECT DISTINCT year FROM v1_talks WHERE speaker_slug = ? ORDER BY year DESC",
+            slug)) {
       out.add(asInt(row.get("year")));
     }
     return out;
@@ -518,7 +552,10 @@ public class Main {
   static List<Integer> sponsorYears(Connection c, String slug) throws SQLException {
     List<Integer> out = new ArrayList<>();
     for (Map<String, Object> row :
-        query(c, "SELECT DISTINCT year FROM v1_sponsorships WHERE sponsor_slug = ? ORDER BY year DESC", slug)) {
+        query(
+            c,
+            "SELECT DISTINCT year FROM v1_sponsorships WHERE sponsor_slug = ? ORDER BY year DESC",
+            slug)) {
       out.add(asInt(row.get("year")));
     }
     return out;
@@ -539,7 +576,8 @@ public class Main {
     return new ArrayList<>(set);
   }
 
-  static List<Map<String, Object>> query(Connection c, String sql, Object... args) throws SQLException {
+  static List<Map<String, Object>> query(Connection c, String sql, Object... args)
+      throws SQLException {
     sqlCount.incrementAndGet();
     if (queryFn != null) {
       return queryFn.query(sql, args);
@@ -671,7 +709,8 @@ public class Main {
     if (url == null || token == null || url.isBlank() || token.isBlank()) {
       return;
     }
-    String base = Optional.ofNullable(System.getenv("PUBLIC_BASE_URL")).orElse("http://127.0.0.1:" + port);
+    String base =
+        Optional.ofNullable(System.getenv("PUBLIC_BASE_URL")).orElse("http://127.0.0.1:" + port);
     Map<String, Object> payload = new LinkedHashMap<>();
     payload.put("language", LANGUAGE);
     payload.put("language_version", LANGUAGE_VERSION);
