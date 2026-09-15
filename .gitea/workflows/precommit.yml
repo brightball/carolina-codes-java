@@ -30,9 +30,10 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ github.token }}
     steps:
-      - run: apt-get update -qq && apt-get install -y --no-install-recommends git curl ca-certificates make unzip tar gzip nodejs
       - run: |
-          set -euo pipefail
+          apt-get update -qq && apt-get install -y --no-install-recommends git curl ca-certificates make unzip tar gzip nodejs
+          command -v node >/dev/null || ln -sf "$(command -v nodejs)" /usr/bin/node
+      - run: |
           token="${GITHUB_TOKEN:-${GITEA_TOKEN:-}}"
           if [ -z "$token" ]; then echo "missing job token for git fetch" >&2; exit 1; fi
           host="${GITHUB_SERVER_URL#https://}"
@@ -58,7 +59,9 @@ jobs:
     container:
       image: docker.io/library/debian:bookworm-slim
     steps:
-      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates nodejs make unzip
+      - run: |
+          apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates nodejs make unzip
+          command -v node >/dev/null || ln -sf "$(command -v nodejs)" /usr/bin/node
       - uses: actions/download-artifact@v3
         with:
           name: prep-workspace
@@ -74,7 +77,9 @@ jobs:
     container:
       image: docker.io/library/debian:bookworm-slim
     steps:
-      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates nodejs make unzip
+      - run: |
+          apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates nodejs make unzip
+          command -v node >/dev/null || ln -sf "$(command -v nodejs)" /usr/bin/node
       - uses: actions/download-artifact@v3
         with:
           name: prep-workspace
@@ -90,7 +95,9 @@ jobs:
     container:
       image: docker.io/library/debian:bookworm-slim
     steps:
-      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates nodejs make unzip
+      - run: |
+          apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates nodejs make unzip
+          command -v node >/dev/null || ln -sf "$(command -v nodejs)" /usr/bin/node
       - uses: actions/download-artifact@v3
         with:
           name: prep-workspace
@@ -106,7 +113,9 @@ jobs:
     container:
       image: docker.io/library/debian:bookworm-slim
     steps:
-      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates nodejs make unzip
+      - run: |
+          apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates nodejs make unzip
+          command -v node >/dev/null || ln -sf "$(command -v nodejs)" /usr/bin/node
       - uses: actions/download-artifact@v3
         with:
           name: prep-workspace
@@ -122,7 +131,9 @@ jobs:
     container:
       image: docker.io/library/debian:bookworm-slim
     steps:
-      - run: apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates nodejs make unzip
+      - run: |
+          apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates nodejs make unzip
+          command -v node >/dev/null || ln -sf "$(command -v nodejs)" /usr/bin/node
       - uses: actions/download-artifact@v3
         with:
           name: prep-workspace
