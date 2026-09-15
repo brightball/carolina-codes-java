@@ -114,7 +114,7 @@ jobs:
       image: docker.io/library/debian:bookworm-slim
     steps:
       - run: |
-          apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates nodejs make unzip
+          apt-get update -qq && apt-get install -y --no-install-recommends ca-certificates nodejs make unzip git
           command -v node >/dev/null || ln -sf "$(command -v nodejs)" /usr/bin/node
       - uses: actions/download-artifact@v3
         with:

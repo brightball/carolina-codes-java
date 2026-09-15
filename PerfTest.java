@@ -299,6 +299,11 @@ public class PerfTest {
       expect(
           !body.contains("github.com/google/google-java-format"),
           name + " does not fetch google-java-format");
+      if ("gitleaks".equals(name)) {
+        expect(
+            body.contains("unzip git"),
+            "gitleaks restore installs git so detect can read the packed .git");
+      }
     }
   }
 
