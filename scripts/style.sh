@@ -8,8 +8,13 @@ cd "$ROOT"
 with_jdk27
 need_gjf
 
+mapfile -t sources < <(app_java_sources)
+if [ "${#sources[@]}" -eq 0 ]; then
+  echo "no application Java sources to format-check" >&2
+  exit 1
+fi
 jar="${TOOLS}/google-java-format-${GJF_VERSION}-all-deps.jar"
-echo "google-java-format ${GJF_VERSION} checking Main.java PerfTest.java" >&2
+echo "google-java-format ${GJF_VERSION} --dry-run ${sources[*]}" >&2
 java -jar "$jar" --version >&2
-java -jar "$jar" --dry-run --set-exit-if-changed Main.java PerfTest.java
-echo "google-java-format: Main.java PerfTest.java match Google Java Format" >&2
+java -jar "$jar" --dry-run --set-exit-if-changed "${sources[@]}"
+echo "google-java-format: ${sources[*]} match Google Java Format" >&2

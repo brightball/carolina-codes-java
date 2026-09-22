@@ -14,5 +14,5 @@ if [ ! -f "$jar" ]; then
 fi
 echo "compiling Main.java PerfTest.java with ${jar} on JDK 27" >&2
 javac -cp "$jar" Main.java PerfTest.java
-echo "running PerfTest against shipped Main.dispatch" >&2
+echo "running PerfTest against shipped Main (HTTP server and Main.main)" >&2
 exec java -cp ".:${jar}" PerfTest

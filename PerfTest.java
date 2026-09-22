@@ -1,18 +1,31 @@
 import com.sun.net.httpserver.HttpServer;
 import java.lang.reflect.Proxy;
 import java.net.Inet6Address;
+import java.net.ServerSocket;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 public class PerfTest {
   static int failed;
+  static final HttpClient HTTP =
+      HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(2)).build();
+  static final String PREVIOUS_JAVA_OPTS =
+      "-XX:MaxRAMPercentage=55.0 -XX:+UseG1GC -XX:ActiveProcessorCount=1"
+          + " -XX:+ExitOnOutOfMemoryError";
 
   static void expect(boolean cond, String msg) {
     if (!cond) {
@@ -117,6 +130,11 @@ public class PerfTest {
         src.contains("static final Pattern SPONSOR_YEAR_SLUG"),
         "sponsor year/slug pattern is static");
     expect(src.contains("payload.toResult()"), "JSON serialization happens after pool release");
+    assertMainBindsBeforeJdbc(src);
+    assertViewsOnly(src);
+    String javaOpts = productionJavaOpts();
+    assertCursorPins();
+    assertScannersDiscoverSources();
 
     HttpServer bound = HttpServer.create(Main.listenAddress(0), 0);
     bound.start();
@@ -155,101 +173,565 @@ public class PerfTest {
       expect("27".equals(majorOf(v)), "language_version major is 27, got " + v);
     }
 
-    boolean live = false;
+    Main.connectFn = PerfTest::stubConnection;
+    Main.queryFn = PerfTest::fixture;
+    Main.resetCounts();
+    HttpServer server = Main.startServer(0);
     try {
-      Class.forName("org.postgresql.Driver");
-      Main.openPool();
-      live = true;
-    } catch (Exception e) {
-      System.err.println("postgres unavailable, using connect/query hooks: " + e.getMessage());
-      Main.connectFn = () -> null;
-      Main.queryFn =
-          (sql, qargs) -> {
-            List<Map<String, Object>> rows = new ArrayList<>();
-            if (sql.contains("FROM v1_speakers")) {
-              for (int i = 0; i < 3; i++) {
-                rows.add(row("slug", "s" + i, "first_name", "A", "last_name", "B"));
-              }
-            } else if (sql.contains("ANY(")) {
-              rows.add(row("speaker_slug", "s0", "year", 2026));
-              rows.add(row("speaker_slug", "s0", "year", 2024));
-            } else if (sql.contains("FROM v1_talks")) {
-              rows.add(
-                  row(
-                      "slug",
-                      "t0",
-                      "title",
-                      "Talk",
-                      "speaker_slug",
-                      "s0",
-                      "year",
-                      2026,
-                      "languages",
-                      List.of("java"),
-                      "topics",
-                      List.of()));
-            }
-            return rows;
-          };
-      Main.poolReady = true;
-      Main.idle.addLast(stubConnection());
-      Main.poolOpened = 1;
-      Main.connectCount.set(1);
+      expect(server.getAddress().getAddress() instanceof Inet6Address, "server socket is IPv6");
+      exerciseRoutes(server.getAddress().getPort());
+    } finally {
+      server.stop(0);
     }
-
-    int bootConnects = Main.connectCount.get();
-    Main.sqlCount.set(0);
-
-    Main.HttpResult listing = Main.dispatch("/v1/speakers", "year=2026");
-    int sql = Main.sqlCount.get();
-    int speakers = countTalksKeys(listing.body);
-    System.err.println(
-        "year list status="
-            + listing.status
-            + " sql="
-            + sql
-            + " speakers="
-            + speakers
-            + " connects="
-            + Main.connectCount.get());
-
-    if (live && listing.status != 200) {
-      expect(false, "live year listing status " + listing.status + " body " + listing.body);
-    }
-    if (listing.status == 200) {
-      expect(speakers >= 3, "year listing returns N>=3 speakers");
-      expect(sql > 0, "listing runs SQL through shipped query wrapper");
-      expect(sql < 2 * speakers, "SQL count does not grow as ~2N");
-      expect(sql <= 4, "year listing SQL is bounded (speakers + talks + years)");
-      assertYearsDesc(listing.body);
-      expect(Main.connectCount.get() == bootConnects, "listing reuses the boot pool");
-
-      ConnectionHolder holder = new ConnectionHolder();
-      try {
-        var c = Main.acquire();
-        holder.c = c;
-        var rows = Main.listSpeakers(c, 2026);
-        assertYearsDescMaps(rows);
-      } finally {
-        Main.release(holder.c);
-      }
-
-      Main.sqlCount.set(0);
-      Main.HttpResult listing2 = Main.dispatch("/v1/speakers", "year=2026");
-      expect(listing2.status == 200, "second catalog request succeeds");
-      expect(
-          Main.connectCount.get() == bootConnects,
-          "second catalog request reuses pool (no extra connect)");
-    } else {
-      expect(sql < 2 * 3, "failed listing did not run per-row SQL for N=3");
-      expect(live || sql > 0 || Main.queryFn != null, "counter path still ran");
-    }
+    coldStarts(javaOpts);
 
     if (failed != 0) {
       System.err.println("perf_test failed");
       System.exit(1);
     }
     System.err.println("perf_test passed");
+  }
+
+  static void assertMainBindsBeforeJdbc(String src) {
+    int mainAt = src.indexOf("public static void main");
+    int next = src.indexOf("static HttpServer startServer", mainAt);
+    expect(mainAt >= 0 && next > mainAt, "main is followed by startServer");
+    if (mainAt < 0 || next <= mainAt) {
+      return;
+    }
+    String body = src.substring(mainAt, next);
+    expect(!body.contains("openPool("), "main does not open the pool");
+    expect(!body.contains("Class.forName"), "main does not load the JDBC driver");
+    expect(!body.contains("newJdbc("), "main does not open JDBC");
+    expect(body.contains("startServer(port)"), "main binds before catalog work");
+  }
+
+  static void assertViewsOnly(String src) {
+    Matcher tables = Pattern.compile("\\bFROM\\s+(\\w+)").matcher(src);
+    boolean saw = false;
+    while (tables.find()) {
+      saw = true;
+      expect(tables.group(1).startsWith("v1_"), "shipped query uses v1_* view " + tables.group(1));
+    }
+    expect(saw, "shipped SQL has FROM clauses");
+  }
+
+  static String productionJavaOpts() throws Exception {
+    String fly = Files.readString(Path.of("fly.toml"));
+    String docker = Files.readString(Path.of("Dockerfile"));
+    Matcher m = Pattern.compile("(?m)^\\s*JAVA_OPTS\\s*=\\s*\"([^\"]*)\"").matcher(fly);
+    String opts = m.find() ? m.group(1) : "";
+    expect(!opts.isEmpty(), "fly.toml sets JAVA_OPTS");
+    expect(docker.contains("ENV JAVA_OPTS=\"" + opts + "\""), "image JAVA_OPTS matches fly.toml");
+    expect(docker.contains("exec java $JAVA_OPTS"), "image exec uses JAVA_OPTS");
+    expect(
+        !opts.equals(PREVIOUS_JAVA_OPTS), "JAVA_OPTS adds startup flags beyond the previous set");
+    expect(opts.contains("-XX:MaxRAMPercentage=55.0"), "heap remains bounded by MaxRAMPercentage");
+    expect(opts.contains("-XX:+ExitOnOutOfMemoryError"), "OOM still exits the process");
+    expect(opts.contains("-XX:+UseSerialGC"), "startup GC is serial");
+    expect(opts.contains("-XX:TieredStopAtLevel=1"), "startup compilation stops at C1");
+    expect(docker.contains("jlink"), "image builds a reduced runtime");
+    expect(docker.contains("--output /opt/java-rt"), "jlink output replaces the full JDK tree");
+    expect(
+        docker.contains("COPY --from=runtime /opt/java-rt /opt/java"),
+        "final image runs the jlink runtime");
+    expect(
+        docker.contains("-XX:AOTCache=/app/app.aot"),
+        "exec uses the AOT cache built into the image");
+    expect(docker.contains("-XX:AOTCacheOutput=/app/app.aot"), "image build writes the AOT cache");
+    expect(
+        docker.contains("-cp /app/app.jar:/app/lib/postgresql-42.7.13.jar Main"),
+        "image classpath is a jar so the AOT cache can be created");
+    expect(
+        docker.contains("-Dcarolina.aot.train=true"), "AOT training does not need a live database");
+    expect(fly.contains("app = \"carolina-codes-java\""), "fly app is carolina-codes-java");
+    expect(fly.contains("internal_port = 8080"), "fly HTTP check uses internal port 8080");
+    expect(fly.contains("path = \"/health\""), "fly HTTP check is GET /health");
+    expect(fly.contains("method = \"GET\""), "fly check method is GET");
+    return opts;
+  }
+
+  static void assertCursorPins() throws Exception {
+    String env = Files.readString(Path.of(".cursor/environment.json"));
+    expect(env.contains("postgresql-42.7.13.jar"), "cursor install fetches JDBC 42.7.13");
+    expect(
+        env.contains("org/postgresql/postgresql/42.7.13/"),
+        "cursor install uses 42.7.13 coordinates");
+    expect(!env.contains("42.7.7"), "cursor install is not pinned to JDBC 42.7.7");
+    String docker = Files.readString(Path.of(".cursor/Dockerfile"));
+    expect(docker.contains("openjdk-27"), "cursor image installs JDK 27");
+    expect(!docker.contains("temurin:26"), "cursor image is not Temurin 26");
+  }
+
+  static void assertScannersDiscoverSources() throws Exception {
+    String sast = Files.readString(Path.of("scripts/sast.sh"));
+    String style = Files.readString(Path.of("scripts/style.sh"));
+    String tools = Files.readString(Path.of("scripts/tools.sh"));
+    expect(tools.contains("-name '*.java'"), "source discovery matches every .java file");
+    expect(sast.contains("app_java_sources"), "sast uses discovered sources");
+    expect(style.contains("app_java_sources"), "style uses discovered sources");
+    expect(sast.contains("\"${pmd_args[@]}\""), "sast passes every discovered file to PMD");
+    expect(
+        style.contains("\"${sources[@]}\""), "style passes every discovered file to the formatter");
+    expect(!sast.contains("-d Main.java"), "sast is not a stale Main.java list");
+    Process proc =
+        new ProcessBuilder("bash", "-c", "source scripts/tools.sh && app_java_sources")
+            .directory(Path.of("").toAbsolutePath().toFile())
+            .start();
+    String listed = new String(proc.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+    int exit = proc.waitFor();
+    expect(exit == 0, "app_java_sources exits 0");
+    List<String> found = new ArrayList<>();
+    try (var walk = Files.walk(Path.of("."))) {
+      walk.filter(p -> p.toString().endsWith(".java"))
+          .filter(p -> !p.toString().contains("/.git/") && !p.toString().contains("/.tools/"))
+          .forEach(p -> found.add(p.toString().replaceFirst("^\\./", "")));
+    }
+    java.util.Collections.sort(found);
+    List<String> fromScript = new ArrayList<>();
+    for (String line : listed.split("\n")) {
+      if (!line.isBlank()) {
+        fromScript.add(line.trim());
+      }
+    }
+    System.err.println("application_java " + fromScript);
+    expect(fromScript.equals(found), "discovered sources match the tree: " + fromScript);
+    expect(fromScript.contains("Main.java"), "discovery includes Main.java");
+    expect(fromScript.contains("PerfTest.java"), "discovery includes PerfTest.java");
+  }
+
+  static HttpResponse<String> get(int port, String pathAndQuery) throws Exception {
+    URI uri = URI.create("http://[::1]:" + port + pathAndQuery);
+    HttpRequest req = HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(3)).GET().build();
+    return HTTP.send(req, HttpResponse.BodyHandlers.ofString());
+  }
+
+  static void exerciseRoutes(int port) throws Exception {
+    HttpResponse<String> root = get(port, "/");
+    HttpResponse<String> health = get(port, "/health");
+    System.err.println("route GET / status=" + root.statusCode() + " body=" + root.body());
+    System.err.println(
+        "route GET /health status=" + health.statusCode() + " body=" + health.body());
+    expect(root.statusCode() == 200, "socket GET / status");
+    expect(root.body().contains("\"language\":\"Java\""), "socket GET / language");
+    expect(health.statusCode() == 200, "socket GET /health status");
+    expect(health.body().contains("\"ok\":true"), "socket GET /health body");
+    expect(Main.connectCount.get() == 0, "socket / and /health do not open JDBC");
+    expect(Main.sqlCount.get() == 0, "socket / and /health do not run SQL");
+
+    List<Endpoint> advertised = endpoints(root.body());
+    for (String path :
+        List.of(
+            "/",
+            "/health",
+            "/v1/years",
+            "/v1/speakers",
+            "/v1/speakers/:slug",
+            "/v1/speakers/:year/:slug",
+            "/v1/sponsors",
+            "/v1/sponsors/:slug",
+            "/v1/sponsors/:year/:slug")) {
+      expect(
+          advertised.stream().anyMatch(ep -> ep.path.equals(path)), "identity advertises " + path);
+    }
+
+    Main.sqlCount.set(0);
+    int connectsBefore = Main.connectCount.get();
+    HttpResponse<String> listing = get(port, "/v1/speakers?year=2026");
+    int sql = Main.sqlCount.get();
+    int speakers = countTalksKeys(listing.body());
+    System.err.println(
+        "route GET /v1/speakers?year=2026 status="
+            + listing.statusCode()
+            + " sql="
+            + sql
+            + " speakers="
+            + speakers
+            + " connects="
+            + Main.connectCount.get()
+            + " body="
+            + listing.body());
+    expect(listing.statusCode() == 200, "year listing status");
+    expect(listing.body().startsWith("{\"data\":"), "year listing data envelope");
+    expect(speakers >= 3, "year listing returns N>=3 speakers");
+    expect(sql > 0, "listing runs SQL through shipped query wrapper");
+    expect(sql < 2 * speakers, "SQL count does not grow as ~2N");
+    expect(sql <= 4, "year listing SQL is bounded (speakers + talks + years)");
+    assertYearsDesc(listing.body());
+    expect(Main.connectCount.get() == connectsBefore + 1, "listing opens the pool once");
+    int bootConnects = Main.connectCount.get();
+
+    Main.sqlCount.set(0);
+    HttpResponse<String> listing2 = get(port, "/v1/speakers?year=2026");
+    System.err.println(
+        "route GET /v1/speakers?year=2026 second status="
+            + listing2.statusCode()
+            + " connects="
+            + Main.connectCount.get());
+    expect(listing2.statusCode() == 200, "second catalog request succeeds");
+    expect(
+        Main.connectCount.get() == bootConnects,
+        "second catalog request reuses pool (no extra connect)");
+
+    for (Endpoint ep : advertised) {
+      if ("/".equals(ep.path) || "/health".equals(ep.path)) {
+        continue;
+      }
+      String path = concrete(ep.path);
+      hitOk(port, path);
+      if (ep.yearQuery) {
+        hitOk(port, path + "?year=2026");
+      }
+    }
+
+    hitMissing(port, "/v1/speakers/missing");
+    hitMissing(port, "/v1/speakers/1999/ada");
+    hitMissing(port, "/v1/sponsors/missing");
+    hitMissing(port, "/v1/sponsors/1999/acme");
+    int sqlUnknown = Main.sqlCount.get();
+    HttpResponse<String> unknown = get(port, "/not-a-route");
+    System.err.println(
+        "route GET /not-a-route status=" + unknown.statusCode() + " body=" + unknown.body());
+    expect(unknown.statusCode() == 404, "unknown path status");
+    expect(unknown.body().contains("not_found"), "unknown path not_found");
+    expect(Main.sqlCount.get() == sqlUnknown, "unknown path runs no SQL");
+    expect(Main.connectCount.get() == bootConnects, "routes reuse the pool");
+
+    ConnectionHolder holder = new ConnectionHolder();
+    try {
+      Connection c = Main.acquire();
+      holder.c = c;
+      assertYearsDescMaps(Main.listSpeakers(c, 2026));
+    } finally {
+      Main.release(holder.c);
+    }
+    expect(Main.connectCount.get() == bootConnects, "listSpeakers reuses the pool");
+
+    int connects = Main.connectCount.get();
+    int queries = Main.sqlCount.get();
+    Main.register(port);
+    expect(Main.connectCount.get() == connects, "register does not open Postgres");
+    expect(Main.sqlCount.get() == queries, "register does not run catalog SQL");
+  }
+
+  static void hitOk(int port, String path) throws Exception {
+    HttpResponse<String> res = get(port, path);
+    System.err.println("route GET " + path + " status=" + res.statusCode() + " body=" + res.body());
+    expect(res.statusCode() == 200, path + " status 200");
+    expect(res.body().startsWith("{\"data\":"), path + " data envelope");
+  }
+
+  static void hitMissing(int port, String path) throws Exception {
+    HttpResponse<String> res = get(port, path);
+    System.err.println("route GET " + path + " status=" + res.statusCode() + " body=" + res.body());
+    expect(res.statusCode() == 404, path + " status 404");
+    expect(res.body().contains("not_found"), path + " not_found");
+  }
+
+  static List<Endpoint> endpoints(String body) {
+    List<Endpoint> out = new ArrayList<>();
+    Matcher m = Pattern.compile("\"path\":\"([^\"]+)\",\"query\":\\[([^\\]]*)]").matcher(body);
+    while (m.find()) {
+      out.add(new Endpoint(m.group(1), m.group(2).contains("year")));
+    }
+    return out;
+  }
+
+  static String concrete(String template) {
+    String slug = template.contains("/sponsors/") ? "acme" : "ada";
+    return template.replace(":year", "2026").replace(":slug", slug);
+  }
+
+  static void coldStarts(String opts) throws Exception {
+    System.err.println("cold_start java_opts=" + opts);
+    coldStart(opts, 1);
+    coldStart(opts, 2);
+  }
+
+  static void coldStart(String opts, int n) throws Exception {
+    int port;
+    try (ServerSocket ss = new ServerSocket(0)) {
+      port = ss.getLocalPort();
+    }
+    List<String> cmd = new ArrayList<>();
+    cmd.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
+    for (String flag : opts.split(" ")) {
+      if (!flag.isEmpty()) {
+        cmd.add(flag);
+      }
+    }
+    cmd.add("-cp");
+    cmd.add(System.getProperty("java.class.path"));
+    cmd.add("Main");
+    ProcessBuilder pb = new ProcessBuilder(cmd);
+    pb.directory(Path.of("").toAbsolutePath().toFile());
+    pb.environment().put("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:1/carolina_dev");
+    pb.environment().put("PORT", Integer.toString(port));
+    pb.environment().put("CAROLINA_URL", "");
+    pb.environment().put("POLYGLOT_REGISTER_TOKEN", "");
+    pb.environment().remove("JAVA_TOOL_OPTIONS");
+    pb.environment().remove("JDK_JAVA_OPTIONS");
+    pb.redirectErrorStream(true);
+    long start = System.nanoTime();
+    Process proc = pb.start();
+    StringBuilder childLog = new StringBuilder();
+    Thread drain =
+        Thread.startVirtualThread(
+            () -> {
+              try {
+                childLog.append(
+                    new String(proc.getInputStream().readAllBytes(), StandardCharsets.UTF_8));
+              } catch (Exception ignored) {
+              }
+            });
+    try {
+      Got health = poll(proc, port, "/health", start);
+      long healthMs = msSince(start);
+      Got root = poll(proc, port, "/", start);
+      long rootMs = msSince(start);
+      System.err.println(
+          "cold_start_"
+              + n
+              + " health_ms="
+              + healthMs
+              + " root_ms="
+              + rootMs
+              + " health="
+              + health.body
+              + " root="
+              + root.body);
+      expect(health.status == 200, "cold start " + n + " /health status");
+      expect(health.body.contains("\"ok\":true"), "cold start " + n + " /health body");
+      expect(root.status == 200, "cold start " + n + " / status");
+      expect(root.body.contains("\"language\":\"Java\""), "cold start " + n + " identity");
+      expect(healthMs < 3000, "cold start " + n + " /health within 3s (" + healthMs + "ms)");
+      expect(rootMs < 3000, "cold start " + n + " / within 3s (" + rootMs + "ms)");
+      expect(proc.isAlive(), "cold start " + n + " still running after identity");
+      HttpResponse<String> catalog = get(port, "/v1/years");
+      expect(
+          catalog.statusCode() == 500, "cold start " + n + " catalog reports the refused connect");
+      expect(
+          catalog.body().contains("refused") || catalog.body().contains("127.0.0.1"),
+          "cold start " + n + " catalog error is the unreachable database");
+      expect(proc.isAlive(), "cold start " + n + " still running after refused connect");
+      HttpResponse<String> again = get(port, "/health");
+      expect(
+          again.statusCode() == 200 && again.body().contains("\"ok\":true"),
+          "cold start " + n + " /health after refused connect");
+      System.err.println(
+          "cold_start_"
+              + n
+              + " after_refused status="
+              + again.statusCode()
+              + " catalog="
+              + catalog.body());
+    } finally {
+      proc.destroy();
+      if (!proc.waitFor(2, TimeUnit.SECONDS)) {
+        proc.destroyForcibly();
+        proc.waitFor(2, TimeUnit.SECONDS);
+      }
+      drain.join(2000);
+      if (!childLog.isEmpty()) {
+        System.err.println("cold_start_" + n + " child: " + childLog.toString().trim());
+      }
+    }
+  }
+
+  static Got poll(Process proc, int port, String path, long start) throws Exception {
+    Got got = new Got();
+    while (msSince(start) < 3000) {
+      if (!proc.isAlive()) {
+        got.body = "process exited";
+        return got;
+      }
+      try {
+        HttpResponse<String> res = get(port, path);
+        got.status = res.statusCode();
+        got.body = res.body();
+        if (got.status == 200) {
+          return got;
+        }
+      } catch (Exception e) {
+        Thread.sleep(15);
+      }
+    }
+    return got;
+  }
+
+  static long msSince(long start) {
+    return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+  }
+
+  static List<Map<String, Object>> fixture(String sql, Object[] args) {
+    if (args == null) {
+      args = new Object[0];
+    }
+    Matcher from = Pattern.compile("(?i)\\bFROM\\s+(\\w+)").matcher(sql);
+    boolean saw = false;
+    while (from.find()) {
+      saw = true;
+      expect(from.group(1).startsWith("v1_"), "SQL stays on v1_* views: " + from.group(1));
+    }
+    expect(saw, "SQL names a view: " + sql);
+    if (sql.contains("FROM v1_years")) {
+      return List.of(
+          row("year", 2026, "slug", "2026", "name", "2026", "status", "announced"),
+          row("year", 2024, "slug", "2024", "name", "2024", "status", "past"));
+    }
+    if (sql.contains("FROM v1_speakers")) {
+      if (sql.contains("WHERE slug = ?")) {
+        String slug = argString(args, 0);
+        if ("ada".equals(slug) || "grace".equals(slug) || "linus".equals(slug)) {
+          return List.of(speaker(slug));
+        }
+        return List.of();
+      }
+      return List.of(speaker("ada"), speaker("grace"), speaker("linus"));
+    }
+    if (sql.contains("FROM v1_year_sponsors")) {
+      if (sql.contains("AND slug = ?")) {
+        int year = argInt(args, 0);
+        String slug = argString(args, 1);
+        if ("acme".equals(slug) && year == 2026) {
+          return List.of(sponsorYear(year));
+        }
+        return List.of();
+      }
+      int year = argInt(args, 0);
+      if (year == 2026) {
+        return List.of(sponsorYear(year));
+      }
+      return List.of();
+    }
+    if (sql.contains("FROM v1_sponsorships")) {
+      if (args.length == 0 || !"acme".equals(argString(args, 0))) {
+        return List.of();
+      }
+      if (sql.contains("SELECT DISTINCT year")) {
+        return List.of(row("year", 2026), row("year", 2024));
+      }
+      return List.of(
+          row("sponsor_slug", "acme", "year", 2026, "tier", "gold"),
+          row("sponsor_slug", "acme", "year", 2024, "tier", "gold"));
+    }
+    if (sql.contains("FROM v1_sponsors")) {
+      if (sql.contains("WHERE slug = ?")) {
+        if ("acme".equals(argString(args, 0))) {
+          return List.of(sponsor());
+        }
+        return List.of();
+      }
+      return List.of(sponsor());
+    }
+    if (sql.contains("FROM v1_talks")) {
+      if (sql.contains("ANY(")) {
+        return List.of(
+            row("speaker_slug", "ada", "year", 2026),
+            row("speaker_slug", "ada", "year", 2024),
+            row("speaker_slug", "grace", "year", 2026),
+            row("speaker_slug", "linus", "year", 2025));
+      }
+      if (sql.contains("AND year = ?")) {
+        String slug = argString(args, 0);
+        int year = argInt(args, 1);
+        if ("ada".equals(slug) && year == 2026) {
+          return List.of(talk(slug, year));
+        }
+        return List.of();
+      }
+      if (sql.contains("SELECT DISTINCT year")) {
+        String slug = argString(args, 0);
+        if ("ada".equals(slug)) {
+          return List.of(row("year", 2026), row("year", 2024));
+        }
+        if ("grace".equals(slug)) {
+          return List.of(row("year", 2026));
+        }
+        if ("linus".equals(slug)) {
+          return List.of(row("year", 2025));
+        }
+        return List.of();
+      }
+      if (sql.contains("WHERE year = ?")) {
+        int year = argInt(args, 0);
+        if (year == 2026) {
+          return List.of(talk("ada", 2026), talk("grace", 2026));
+        }
+        return List.of();
+      }
+      if (sql.contains("speaker_slug = ?")) {
+        String slug = argString(args, 0);
+        if ("ada".equals(slug)) {
+          return List.of(talk("ada", 2026), talk("ada", 2024));
+        }
+        if ("grace".equals(slug)) {
+          return List.of(talk("grace", 2026));
+        }
+        if ("linus".equals(slug)) {
+          return List.of(talk("linus", 2025));
+        }
+        return List.of();
+      }
+    }
+    expect(false, "fixture has no rows for SQL: " + sql);
+    return List.of();
+  }
+
+  static String argString(Object[] args, int index) {
+    return String.valueOf(args[index]);
+  }
+
+  static int argInt(Object[] args, int index) {
+    Object value = args[index];
+    if (value instanceof Number number) {
+      return number.intValue();
+    }
+    return Integer.parseInt(String.valueOf(value));
+  }
+
+  static Map<String, Object> speaker(String slug) {
+    return row(
+        "slug", slug, "first_name", slug, "last_name", "Speaker", "name", slug, "featured", false);
+  }
+
+  static Map<String, Object> talk(String slug, int year) {
+    return row(
+        "slug",
+        "t-" + slug + "-" + year,
+        "title",
+        "Talk " + slug,
+        "speaker_slug",
+        slug,
+        "year",
+        year,
+        "languages",
+        List.of("java"),
+        "topics",
+        List.of("jvm"));
+  }
+
+  static Map<String, Object> sponsor() {
+    return row("slug", "acme", "name", "Acme", "website", "https://acme.example");
+  }
+
+  static Map<String, Object> sponsorYear(int year) {
+    return row("slug", "acme", "name", "Acme", "year", year, "tier", "gold", "featured", false);
+  }
+
+  static final class Endpoint {
+    final String path;
+    final boolean yearQuery;
+
+    Endpoint(String path, boolean yearQuery) {
+      this.path = path;
+      this.yearQuery = yearQuery;
+    }
+  }
+
+  static final class Got {
+    int status;
+    String body = "";
   }
 
   static void assertGiteaWorkflowGraph() throws Exception {

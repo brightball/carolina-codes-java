@@ -134,15 +134,33 @@ public class Main {
   }
 
   public static void main(String[] args) throws Exception {
-    Class.forName("org.postgresql.Driver");
-    openPool();
+    if (Boolean.getBoolean("carolina.aot.train")) {
+      aotTrain();
+      return;
+    }
     int port = Integer.parseInt(System.getenv().getOrDefault("PORT", "4007"));
+    startServer(port);
+    System.err.println("carolina-codes-java listening on :" + port);
+    Thread.startVirtualThread(() -> register(port));
+  }
+
+  static HttpServer startServer(int port) throws Exception {
     HttpServer server = HttpServer.create(listenAddress(port), 0);
     server.createContext("/", Main::handle);
     server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
     server.start();
-    System.err.println("carolina-codes-java listening on :" + port);
-    Thread.startVirtualThread(() -> register(port));
+    return server;
+  }
+
+  // Image build loads the listen path and the driver, then exits so the AOT
+  // cache can be written. No live database: a refused connect is enough.
+  static void aotTrain() throws Exception {
+    loadDriver();
+    dispatch("/health", "");
+    dispatch("/", "");
+    dispatch("/v1/years", "");
+    HttpServer server = startServer(0);
+    server.stop(0);
   }
 
   static String listenHost() {
@@ -166,7 +184,12 @@ public class Main {
     return row;
   }
 
+  static void loadDriver() throws ClassNotFoundException {
+    Class.forName("org.postgresql.Driver");
+  }
+
   static Connection newJdbc() throws Exception {
+    loadDriver();
     String raw = DSN.replace("postgres://", "http://").replace("postgresql://", "http://");
     URI u = URI.create(raw);
     String user = "postgres";

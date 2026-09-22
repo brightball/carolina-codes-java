@@ -72,6 +72,15 @@ need_pmd() {
   unzip -q -o "$zip" -d "$TOOLS"
 }
 
+# Every application .java file. Callers must not keep a fixed source list.
+app_java_sources() {
+  find . -type f -name '*.java' \
+    -not -path './.git/*' \
+    -not -path './.tools/*' \
+    | sed 's|^\./||' \
+    | sort
+}
+
 with_jdk27() {
   JAVA_HOME="$(${ROOT}/scripts/java-home.sh)"
   export JAVA_HOME
