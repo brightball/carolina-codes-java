@@ -109,6 +109,7 @@ public class PerfTest {
     expect("27".equals(spec), "JVM specification version is 27, got " + spec);
     String runtime = System.getProperty("java.version");
     expect("27".equals(majorOf(runtime)), "java.version major is 27, got " + runtime);
+    assertDocumentedContract();
     assertGiteaWorkflowGraph();
     assertChecksumsStayOffStdout(Path.of("scripts/java-home.sh"));
     assertChecksumsStayOffStdout(Path.of("scripts/tools.sh"));
@@ -190,6 +191,39 @@ public class PerfTest {
       System.exit(1);
     }
     System.err.println("perf_test passed");
+  }
+
+  static void assertDocumentedContract() throws Exception {
+    String readme = Files.readString(Path.of("README.md"));
+    String agents = Files.readString(Path.of("AGENTS.md"));
+    String decisions = Files.readString(Path.of("DECISIONS.md"));
+    String memory = Files.readString(Path.of("MEMORY.md"));
+    expect(readme.contains("OpenJDK 27"), "README states OpenJDK 27");
+    expect(readme.contains("com.sun.net.httpserver"), "README states com.sun.net.httpserver");
+    expect(readme.contains("42.7.13"), "README states PostgreSQL JDBC 42.7.13");
+    expect(readme.contains("jlink"), "README states the jlink runtime");
+    expect(readme.contains("AOT cache"), "README states the JDK AOT cache");
+    expect(
+        readme.contains("CRaC is not a dependency"),
+        "README does not describe CRaC as a dependency");
+    expect(agents.contains("Do not query Ash tables"), "AGENTS.md forbids Ash tables");
+    for (String view :
+        List.of(
+            "v1_speakers",
+            "v1_sponsors",
+            "v1_years",
+            "v1_talks",
+            "v1_sponsorships",
+            "v1_year_speakers",
+            "v1_year_sponsors")) {
+      expect(agents.contains(view), "AGENTS.md names v1 view " + view);
+    }
+    expect(agents.contains("DECISIONS.md"), "AGENTS.md points at DECISIONS.md");
+    expect(agents.contains("MEMORY.md"), "AGENTS.md points at MEMORY.md");
+    expect(decisions.contains("## Use the JDK HTTP server"), "DECISIONS.md records httpserver");
+    expect(decisions.contains("Status: Accepted"), "DECISIONS.md has an accepted record");
+    expect(memory.contains("OpenJDK 27"), "MEMORY.md pins OpenJDK 27");
+    expect(memory.contains("PATH"), "MEMORY.md records the PATH Java pitfall");
   }
 
   static void assertMainBindsBeforeJdbc(String src) {

@@ -2,6 +2,10 @@
 
 Read-only v1 polyglot API for Carolina Code Conference. Queries `v1_*` SQL views over `com.sun.net.httpserver` and the PostgreSQL JDBC driver.
 
+Language is Java on OpenJDK 27. The framework is `com.sun.net.httpserver`, the JDK 27 `jdk.httpserver` module, so there is no separate framework artifact. The application dependency is PostgreSQL JDBC 42.7.13, vendored at `lib/postgresql-42.7.13.jar`. The container runtime is a jlink custom runtime plus a JDK AOT cache (`-XX:AOTCache`). Startup tuning is that jlink runtime and the AOT cache. CRaC is not a dependency.
+
+Agent contract: `AGENTS.md`. Current pins and pitfalls: `MEMORY.md`. Why those choices were made: `DECISIONS.md`.
+
 ```bash
 make test        # JDK 27 javac + PerfTest on shipped Main.dispatch
 make sast        # PMD security ruleset on Main.java / PerfTest.java
