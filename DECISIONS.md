@@ -42,7 +42,7 @@ Agents compile and test with the home from `scripts/java-home.sh`. Checksums for
 
 ## jlink runtime and JDK AOT cache
 
-- Status: Accepted
+- Status: Accepted for jlink and `-XX:AOTCache`. Heap sizing is superseded by "Pin the AOT heap under the compressed-oops cutoff".
 - Date: 2026-09-22
 
 ### Context
@@ -56,6 +56,23 @@ The Dockerfile builds a jlink runtime at `/opt/java-rt` and an AOT cache at `/ap
 ### Consequences
 
 The image classpath is `/app/app.jar` plus `lib/postgresql-42.7.13.jar`. AOT cache creation rejects a directory on the classpath. Training does not need a live database; a refused connect is enough. `jlink --strip-debug` needs `objcopy`, so the build stage installs `binutils`. Adding a JDK API means adding its module to the `jlink --add-modules` line. CRaC checkpoints are not part of the build.
+
+## Pin the AOT heap under the compressed-oops cutoff
+
+- Status: Accepted
+- Date: 2026-10-07
+
+### Context
+
+`JAVA_OPTS` used `-XX:MaxRAMPercentage=55.0` for both AOT training and the Fly process. That percentage follows the machine's RAM. On a builder with about 64 GB it is a 34 GB heap, and the JVM turns compressed oops off. The Fly machine has 512 MB, so the same flag leaves compressed oops on. JDK 27 then refuses the cache (`Unable to use AOT cache`, saved `UseCompressedOops` 0 against runtime 1) and every autostop pays a full cold start. JDK 27 removed `-XX:MaxRAM`, so the builder cannot be capped by pretending it has less memory.
+
+### Decision
+
+Training and the Fly process share one heap setting: `-Xmx256m -XX:+UseCompressedOops -XX:+UseCompactObjectHeaders`, plus the existing serial-GC startup flags. `fly.toml` and both `JAVA_OPTS` lines in the Dockerfile carry that string. Compressed oops stays on. The heap is not a percentage of detected RAM.
+
+### Consequences
+
+The archive records compressed oops and a 256 MB max heap, which is the heap the 512 MB machine runs. A large builder can no longer train a cache that machine will reject. Do not put `MaxRAMPercentage` back on these commands. 256 MB leaves the rest of the 512 MB machine for metaspace, the mapped cache, and native memory.
 
 ## Serve health before Postgres
 

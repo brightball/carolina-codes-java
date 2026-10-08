@@ -10,7 +10,7 @@ primary_region = "iad"
   PORT = "8080"
   CAROLINA_URL = "http://carolina-codes.internal:8080"
   PUBLIC_BASE_URL = "https://carolina-codes-java.fly.dev"
-  JAVA_OPTS = "-XX:MaxRAMPercentage=55.0 -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -XX:+ExitOnOutOfMemoryError -XX:TieredStopAtLevel=1 -XX:CICompilerCount=1 -Xss512k"
+  JAVA_OPTS = "-Xmx256m -XX:+UseCompressedOops -XX:+UseCompactObjectHeaders -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -XX:+ExitOnOutOfMemoryError -XX:TieredStopAtLevel=1 -XX:CICompilerCount=1 -Xss512k"
 
 [http_service]
   internal_port = 8080

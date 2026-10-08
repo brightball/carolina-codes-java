@@ -59,7 +59,7 @@ Checks are separate Make targets: `make test`, `make sast`, `make audit`, `make 
 
 The listen address is `::`. `GET /health` and `GET /` run before any Postgres connection. The pool opens on the first catalog request. Registration runs on a virtual thread and does not open the pool.
 
-The container runtime is a jlink image plus a JDK AOT cache (`-XX:AOTCache=/app/app.aot`). CRaC is not used. The image classpath is `app.jar` plus the JDBC jar, because AOT cache creation rejects a directory on the classpath. Training uses `-Dcarolina.aot.train=true` and does not need a live database.
+The container runtime is a jlink image plus a JDK AOT cache (`-XX:AOTCache=/app/app.aot`). `JAVA_OPTS` pins the heap at `-Xmx256m` with compressed oops and compact object headers on, so training and the 512 MB machine load that cache. CRaC is not used. The image classpath is `app.jar` plus the JDBC jar, because AOT cache creation rejects a directory on the classpath. Training uses `-Dcarolina.aot.train=true` and does not need a live database.
 
 ## Decisions and memory
 

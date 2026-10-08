@@ -45,7 +45,7 @@ FROM runtime AS aot
 WORKDIR /app
 COPY lib ./lib
 COPY --from=build /app/app.jar ./app.jar
-ENV JAVA_OPTS="-XX:MaxRAMPercentage=55.0 -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -XX:+ExitOnOutOfMemoryError -XX:TieredStopAtLevel=1 -XX:CICompilerCount=1 -Xss512k"
+ENV JAVA_OPTS="-Xmx256m -XX:+UseCompressedOops -XX:+UseCompactObjectHeaders -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -XX:+ExitOnOutOfMemoryError -XX:TieredStopAtLevel=1 -XX:CICompilerCount=1 -Xss512k"
 # AOT cache creation rejects a directory on the classpath, so the app is a jar.
 RUN /opt/java-rt/bin/java $JAVA_OPTS -XX:AOTCacheOutput=/app/app.aot -Dcarolina.aot.train=true -cp /app/app.jar:/app/lib/postgresql-42.7.13.jar Main \
     && test -s /app/app.aot
@@ -62,6 +62,6 @@ COPY lib ./lib
 COPY --from=build /app/app.jar ./app.jar
 COPY --from=aot /app/app.aot ./app.aot
 ENV PORT=8080
-ENV JAVA_OPTS="-XX:MaxRAMPercentage=55.0 -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -XX:+ExitOnOutOfMemoryError -XX:TieredStopAtLevel=1 -XX:CICompilerCount=1 -Xss512k"
+ENV JAVA_OPTS="-Xmx256m -XX:+UseCompressedOops -XX:+UseCompactObjectHeaders -XX:+UseSerialGC -XX:ActiveProcessorCount=1 -XX:+ExitOnOutOfMemoryError -XX:TieredStopAtLevel=1 -XX:CICompilerCount=1 -Xss512k"
 EXPOSE 8080
 CMD ["sh", "-c", "exec java $JAVA_OPTS -XX:AOTCache=/app/app.aot -cp /app/app.jar:/app/lib/postgresql-42.7.13.jar Main"]

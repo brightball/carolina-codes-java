@@ -1,4 +1,6 @@
 import com.sun.net.httpserver.HttpServer;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.lang.reflect.Proxy;
 import java.net.Inet6Address;
 import java.net.ServerSocket;
@@ -12,12 +14,14 @@ import java.nio.file.Path;
 import java.sql.Connection;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 public class PerfTest {
   static int failed;
@@ -184,6 +188,7 @@ public class PerfTest {
     } finally {
       server.stop(0);
     }
+    assertAotCacheLoads(javaOpts);
     coldStarts(javaOpts);
 
     if (failed != 0) {
@@ -260,7 +265,10 @@ public class PerfTest {
     expect(docker.contains("exec java $JAVA_OPTS"), "image exec uses JAVA_OPTS");
     expect(
         !opts.equals(PREVIOUS_JAVA_OPTS), "JAVA_OPTS adds startup flags beyond the previous set");
-    expect(opts.contains("-XX:MaxRAMPercentage=55.0"), "heap remains bounded by MaxRAMPercentage");
+    expect(opts.contains("-Xmx256m"), "heap is fixed at 256m");
+    expect(opts.contains("-XX:+UseCompressedOops"), "compressed oops stays enabled");
+    expect(opts.contains("-XX:+UseCompactObjectHeaders"), "compact object headers stay enabled");
+    expect(!opts.contains("MaxRAMPercentage"), "heap is not a percentage of detected RAM");
     expect(opts.contains("-XX:+ExitOnOutOfMemoryError"), "OOM still exits the process");
     expect(opts.contains("-XX:+UseSerialGC"), "startup GC is serial");
     expect(opts.contains("-XX:TieredStopAtLevel=1"), "startup compilation stops at C1");
@@ -474,6 +482,177 @@ public class PerfTest {
   static String concrete(String template) {
     String slug = template.contains("/sponsors/") ? "acme" : "ada";
     return template.replace(":year", "2026").replace(":slug", slug);
+  }
+
+  static boolean isMainClass(Path path) {
+    String name = path.getFileName().toString();
+    return name.equals("Main.class") || (name.startsWith("Main$") && name.endsWith(".class"));
+  }
+
+  static String javaBin(String tool) {
+    return Path.of(System.getProperty("java.home"), "bin", tool).toString();
+  }
+
+  static List<String> javaCommand(String opts) {
+    List<String> cmd = new ArrayList<>();
+    cmd.add(javaBin("java"));
+    for (String flag : opts.split(" ")) {
+      if (!flag.isEmpty()) {
+        cmd.add(flag);
+      }
+    }
+    return cmd;
+  }
+
+  static void deleteTree(Path dir) throws Exception {
+    if (dir == null || !Files.exists(dir)) {
+      return;
+    }
+    try (Stream<Path> walk = Files.walk(dir)) {
+      for (Path path : walk.sorted(Comparator.reverseOrder()).toList()) {
+        Files.deleteIfExists(path);
+      }
+    }
+  }
+
+  static String readAvailable(InputStream in, ByteArrayOutputStream buf) throws Exception {
+    byte[] b = new byte[4096];
+    while (in.available() > 0) {
+      int n = in.read(b);
+      if (n < 0) {
+        break;
+      }
+      buf.write(b, 0, n);
+    }
+    return buf.toString(StandardCharsets.UTF_8);
+  }
+
+  // Train an AOT cache with the production flags, then load it in a second JVM.
+  // The classpath is a jar: cache creation rejects a directory.
+  static String trainAndLoadAot(Path dir, Path jdbc, String opts) throws Exception {
+    Path app = dir.resolve("app.jar");
+    Path cache = dir.resolve("app.aot");
+    List<String> jarCmd = new ArrayList<>();
+    jarCmd.add(javaBin("jar"));
+    jarCmd.add("cf");
+    jarCmd.add(app.toString());
+    try (Stream<Path> classes = Files.list(Path.of("."))) {
+      for (Path classFile : classes.filter(PerfTest::isMainClass).sorted().toList()) {
+        jarCmd.add(classFile.getFileName().toString());
+      }
+    }
+    expect(jarCmd.size() > 3, "AOT jar includes Main classes");
+    ProcessBuilder jarPb = new ProcessBuilder(jarCmd);
+    jarPb.redirectErrorStream(true);
+    Process jarProc = jarPb.start();
+    String jarOut = new String(jarProc.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+    boolean jarDone = jarProc.waitFor(30, TimeUnit.SECONDS);
+    int jarExit = jarDone ? jarProc.exitValue() : -1;
+    expect(jarDone && jarExit == 0, "jar app for AOT");
+    if (!jarDone || jarExit != 0) {
+      System.err.println(jarOut);
+      return jarOut;
+    }
+
+    String cp = app.toAbsolutePath() + System.getProperty("path.separator") + jdbc.toAbsolutePath();
+    List<String> train = javaCommand(opts);
+    train.add("-XX:AOTCacheOutput=" + cache.toAbsolutePath());
+    train.add("-Dcarolina.aot.train=true");
+    train.add("-cp");
+    train.add(cp);
+    train.add("Main");
+    ProcessBuilder trainPb = new ProcessBuilder(train);
+    trainPb.redirectErrorStream(true);
+    trainPb.environment().remove("JAVA_TOOL_OPTIONS");
+    trainPb.environment().remove("JDK_JAVA_OPTIONS");
+    Process trainProc = trainPb.start();
+    String trainOut = new String(trainProc.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+    boolean trainDone = trainProc.waitFor(60, TimeUnit.SECONDS);
+    if (!trainDone) {
+      trainProc.destroyForcibly();
+      trainProc.waitFor(2, TimeUnit.SECONDS);
+    }
+    int trainExit = trainDone ? trainProc.exitValue() : -1;
+    expect(trainDone && trainExit == 0, "AOT training exits 0");
+    expect(Files.isRegularFile(cache) && Files.size(cache) > 0, "AOT training writes a cache");
+    if (!trainDone || trainExit != 0) {
+      System.err.println(trainOut);
+      return trainOut;
+    }
+
+    int port;
+    try (ServerSocket ss = new ServerSocket(0)) {
+      port = ss.getLocalPort();
+    }
+    List<String> load = javaCommand(opts);
+    load.add("-XX:AOTCache=" + cache.toAbsolutePath());
+    load.add("-Xlog:aot=info");
+    load.add("-cp");
+    load.add(cp);
+    load.add("Main");
+    ProcessBuilder loadPb = new ProcessBuilder(load);
+    loadPb.redirectErrorStream(true);
+    loadPb.environment().remove("JAVA_TOOL_OPTIONS");
+    loadPb.environment().remove("JDK_JAVA_OPTIONS");
+    loadPb.environment().put("PORT", Integer.toString(port));
+    loadPb
+        .environment()
+        .put("DATABASE_URL", "postgres://postgres:postgres@127.0.0.1:1/carolina_dev");
+    loadPb.environment().put("CAROLINA_URL", "");
+    loadPb.environment().put("POLYGLOT_REGISTER_TOKEN", "");
+    Process loadProc = loadPb.start();
+    ByteArrayOutputStream buf = new ByteArrayOutputStream();
+    long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
+    String log = "";
+    try {
+      while (System.nanoTime() < end) {
+        log = readAvailable(loadProc.getInputStream(), buf);
+        if (log.contains("listening on") && log.contains("Opened AOT cache")) {
+          Thread.sleep(50);
+          log = readAvailable(loadProc.getInputStream(), buf);
+          break;
+        }
+        if (!loadProc.isAlive()) {
+          log = readAvailable(loadProc.getInputStream(), buf);
+          break;
+        }
+        Thread.sleep(20);
+      }
+    } finally {
+      loadProc.destroy();
+      if (!loadProc.waitFor(2, TimeUnit.SECONDS)) {
+        loadProc.destroyForcibly();
+        loadProc.waitFor(2, TimeUnit.SECONDS);
+      }
+    }
+    return log;
+  }
+
+  static void assertAotCacheLoads(String opts) throws Exception {
+    Path jdbc = Path.of("lib/postgresql-42.7.13.jar");
+    expect(Files.isRegularFile(jdbc), "JDBC jar is present for AOT training");
+    for (int n = 1; n <= 2; n++) {
+      Path dir = Files.createTempDirectory("carolina-aot-");
+      try {
+        String log = trainAndLoadAot(dir, jdbc, opts);
+        expect(log.contains("Opened AOT cache"), "AOT load " + n + " opened the cache");
+        expect(
+            log.contains("Using AOT-linked classes: true"),
+            "AOT load " + n + " linked classes from the cache");
+        expect(!log.contains("Unable to use AOT cache"), "AOT load " + n + " kept the cache");
+        expect(
+            !log.contains("saved state of UseCompressedOops"),
+            "AOT load " + n + " compressed oops state matches");
+        expect(
+            !log.contains("Unable to map shared spaces"),
+            "AOT load " + n + " mapped shared spaces");
+        expect(
+            log.contains("UseCompressedOops = 1"),
+            "AOT load " + n + " trained with compressed oops");
+      } finally {
+        deleteTree(dir);
+      }
+    }
   }
 
   static void coldStarts(String opts) throws Exception {

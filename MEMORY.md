@@ -26,7 +26,7 @@ For this OpenJDK 27 and `com.sun.net.httpserver` tree, the JDK specification ver
 
 jlink modules, from the Dockerfile: `java.base`, `java.sql`, `java.naming`, `java.management`, `java.net.http`, `java.security.jgss`, `java.desktop`, `java.xml`, `java.logging`, `jdk.httpserver`, `jdk.crypto.ec`, `jdk.charsets`.
 
-`JAVA_OPTS` in `fly.toml` and the image `ENV` are the same string. `PerfTest` checks that. The flags include `-XX:MaxRAMPercentage=55.0`, `-XX:+UseSerialGC`, `-XX:ActiveProcessorCount=1`, `-XX:+ExitOnOutOfMemoryError`, `-XX:TieredStopAtLevel=1`, `-XX:CICompilerCount=1`, and `-Xss512k`. The process also loads `-XX:AOTCache=/app/app.aot`.
+`JAVA_OPTS` in `fly.toml` and the image `ENV` are the same string. `PerfTest` checks that. The flags are `-Xmx256m`, `-XX:+UseCompressedOops`, `-XX:+UseCompactObjectHeaders`, `-XX:+UseSerialGC`, `-XX:ActiveProcessorCount=1`, `-XX:+ExitOnOutOfMemoryError`, `-XX:TieredStopAtLevel=1`, `-XX:CICompilerCount=1`, and `-Xss512k`. The process also loads `-XX:AOTCache=/app/app.aot`. Do not size this heap with `MaxRAMPercentage`.
 
 Checksums for the JDK tarball and the check CLIs stay in `Dockerfile`, `scripts/java-home.sh`, and `scripts/tools.sh`. Do not copy the hashes into this file.
 
@@ -52,6 +52,7 @@ make hooks       # install pre-commit hooks
 - `java` on `PATH` may be 26. A home counts only when `java.specification.version` is 27. Checks call `scripts/java-home.sh`.
 - `sha256sum` output in `scripts/java-home.sh` and `scripts/tools.sh` stays on stderr. `java-home.sh` prints only the home path on stdout. A checksum printed on stdout breaks `JAVA_HOME`.
 - AOT cache creation rejects a directory on the classpath. The image runs `/app/app.jar` plus the JDBC jar.
+- The AOT cache records compressed oops and the max heap. `-XX:MaxRAMPercentage` on a large builder turns compressed oops off, and the 512 MB machine then logs `Unable to use AOT cache`. The pin is `-Xmx256m` with `-XX:+UseCompressedOops` and `-XX:+UseCompactObjectHeaders`. JDK 27 removed `-XX:MaxRAM`.
 - AOT training is `-Dcarolina.aot.train=true`. It loads the driver, dispatches `/health`, `/`, and `/v1/years`, binds port 0, and exits. It does not need a reachable database.
 - `GET /health` and `GET /` must not open JDBC or run SQL. The pool opens on the first catalog request.
 - Registration runs on a virtual thread after `startServer` and must not open the pool or run catalog SQL. An empty `CAROLINA_URL` or token skips it. A failed POST is logged and the server keeps running.
